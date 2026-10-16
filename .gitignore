@@ -13,3 +13,9 @@ mentorust.stop
 Thumbs.db
 .vscode/
 .idea/
+
+# Npcap 免费版许可禁止对外再分发（OEM 版才可随产品分发）：
+# 任何自带 Npcap 安装器的产物都不得入库、不得公开发布。
+dist/Mentorust-CSUFT-portable-npcap.zip
+dist/portable/npcap-*.exe
+npcap-*.exe

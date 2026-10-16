@@ -5,6 +5,11 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 
+# Text shipped inside the release packages: keep Windows line endings,
+# since these files go straight into the zip handed to end users.
+dist/*.txt text eol=crlf
+dist/portable/*.txt text eol=crlf
+
 # Binaries - never touch
 *.exe binary
 *.dll binary

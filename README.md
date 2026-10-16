@@ -26,14 +26,36 @@
 
 ## 快速开始（Windows · 免编译）
 
-1. 下载 `dist/Mentorust-CSUFT-*-win64.zip` 并解压。
-2. **安装 Npcap**（必需，抓包驱动）：<https://npcap.com/#download>
-   安装时务必勾选 **`Install Npcap in WinPcap API-compatible Mode`**。
-3. 双击 `install.bat`（会安装到 `%LOCALAPPDATA%\Mentorust` 并创建桌面快捷方式），
-   或者直接双击 `mentorust.exe` 免安装运行。
-4. 打开界面后填写校园网账号 / 密码，选择有线网卡，点「连接」。
+两种包任选其一，**都用同一个 `mentorust.exe`**：
 
-> 首次连接时若提示没找到网卡，请展开下拉框手动选那张带 `10.x` 地址的网卡。
+| 包 | 特点 | 适合 |
+| --- | --- | --- |
+| `dist/Mentorust-CSUFT-portable.zip` | **便携版**，解压即用、配置只写在同目录（Npcap 仍需装一次） | 放 U 盘 / 任意文件夹 |
+| `dist/Mentorust-CSUFT-v0.1.0-win64.zip` | **安装版**，装到 `%LOCALAPPDATA%` 并建桌面快捷方式 | 固定一台电脑长期用 |
+
+**便携版（推荐）**
+
+1. 解压 `dist/Mentorust-CSUFT-portable.zip`，**全部文件解压到同一文件夹**。
+2. 双击 `run.bat` —— 它会**自动检查 Npcap**：
+   装了就跳过；没装则打开 <https://npcap.com/#download> 引导你安装。
+3. 窗口里填写校园网账号 / 密码，选有线网卡，点「连接」。
+
+**安装版**
+
+1. 解压 `dist/Mentorust-CSUFT-v0.1.0-win64.zip`。
+2. 先装 Npcap（见下），再双击 `install.bat`。
+3. 从桌面快捷方式启动，填账号密码，点「连接」。
+
+> **首次连接时若提示没找到网卡**，请展开下拉框手动选那张带 `10.x` 地址的网卡。
+
+### 关于 Npcap（必需）
+
+Mentorust 靠 Npcap 收发 802.1X 认证帧，**没有它无法工作**。
+安装时务必勾选 **`Install Npcap in WinPcap API-compatible Mode`**。
+
+> ⚠️ **本仓库不附带 Npcap 安装器**。Npcap 免费版许可明确写着
+> “may be used but **not externally redistributed**”（可使用，但不得对外再分发），
+> 只有付费 OEM 版才允许随产品分发。所以这里只提供官网链接，请自行下载安装。
 
 ---
 
@@ -119,7 +141,14 @@ mentorust print-mac                     # 列出本机网卡名称与 MAC
 │   ├── eap/                    # EAP / EAPOL 状态机
 │   └── packets/                # EAPOL / 锐捷私有帧构造
 ├── pcap/                       # 打过补丁的 pcap crate（必须保留）
-└── dist/                       # 预编译产物与一键安装包
+└── dist/                       # 预编译产物
+    ├── mentorust.exe           # 脱敏主程序（两个包共用）
+    ├── install.bat / uninstall.bat / README.txt    # 安装版脚本
+    ├── Mentorust-CSUFT-v0.1.0-win64.zip            # 安装版包
+    └── portable/               # 便携版
+        ├── run.bat             # 启动器：自动检测 Npcap（纯 ASCII，避免 cmd 乱码）
+        ├── README.txt          # 便携版中文说明（UTF-8 带 BOM）
+        └── Mentorust-CSUFT-portable.zip            # 便携版包
 ```
 
 ---
