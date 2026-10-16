@@ -26,9 +26,9 @@
 
 ## 快速开始（Windows · 免编译）
 
-本仓库只提供**一个便携包**：`dist/Mentorust-CSUFT-portable.zip`。
+**[前往 Releases 下载](https://github.com/jinnianliuxing/Mentorust-CSUFT/releases/latest)** —— 仓库内也留了一份，路径为 `dist/Mentorust-CSUFT-portable.zip`。
 
-1. 解压 `dist/Mentorust-CSUFT-portable.zip`，**全部文件解压到同一文件夹**。
+1. 解压，**全部文件解压到同一文件夹**。
 2. 双击 `run.bat` —— 它会**自动检查 Npcap**：
    装了就跳过；没装则打开 <https://npcap.com/#download> 引导你安装。
 3. 窗口里填写校园网账号 / 密码，选有线网卡，点「连接」。
