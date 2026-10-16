@@ -26,27 +26,15 @@
 
 ## 快速开始（Windows · 免编译）
 
-两种包任选其一，**都用同一个 `mentorust.exe`**：
-
-| 包 | 特点 | 适合 |
-| --- | --- | --- |
-| `dist/Mentorust-CSUFT-portable.zip` | **便携版**，解压即用、配置只写在同目录（Npcap 仍需装一次） | 放 U 盘 / 任意文件夹 |
-| `dist/Mentorust-CSUFT-v0.1.0-win64.zip` | **安装版**，装到 `%LOCALAPPDATA%` 并建桌面快捷方式 | 固定一台电脑长期用 |
-
-**便携版（推荐）**
+本仓库只提供**一个便携包**：`dist/Mentorust-CSUFT-portable.zip`。
 
 1. 解压 `dist/Mentorust-CSUFT-portable.zip`，**全部文件解压到同一文件夹**。
 2. 双击 `run.bat` —— 它会**自动检查 Npcap**：
    装了就跳过；没装则打开 <https://npcap.com/#download> 引导你安装。
 3. 窗口里填写校园网账号 / 密码，选有线网卡，点「连接」。
 
-**安装版**
-
-1. 解压 `dist/Mentorust-CSUFT-v0.1.0-win64.zip`。
-2. 先装 Npcap（见下），再双击 `install.bat`。
-3. 从桌面快捷方式启动，填账号密码，点「连接」。
-
 > **首次连接时若提示没找到网卡**，请展开下拉框手动选那张带 `10.x` 地址的网卡。
+> 想要桌面快捷方式的话：右键 `mentorust.exe` → 发送到 → 桌面快捷方式。
 
 ### 关于 Npcap（必需）
 
@@ -142,13 +130,11 @@ mentorust print-mac                     # 列出本机网卡名称与 MAC
 │   └── packets/                # EAPOL / 锐捷私有帧构造
 ├── pcap/                       # 打过补丁的 pcap crate（必须保留）
 └── dist/                       # 预编译产物
-    ├── mentorust.exe           # 脱敏主程序（两个包共用）
-    ├── install.bat / uninstall.bat / README.txt    # 安装版脚本
-    ├── Mentorust-CSUFT-v0.1.0-win64.zip            # 安装版包
-    ├── Mentorust-CSUFT-portable.zip                # 便携版包
-    └── portable/               # 便携版脚本源
+    ├── mentorust.exe           # 脱敏主程序（打包时复制进便携包）
+    ├── Mentorust-CSUFT-portable.zip                # 便携包（对外发布）
+    └── portable/               # 便携包内容源
         ├── run.bat             # 启动器：自动检测 Npcap（纯 ASCII，避免 cmd 乱码）
-        └── README.txt          # 便携版中文说明（UTF-8 带 BOM）
+        └── README.txt          # 中文说明（UTF-8 带 BOM）
 ```
 
 ---
