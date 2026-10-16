@@ -1,0 +1,15 @@
+# 编译产物
+/target
+
+# 本地运行配置（含账号密码，绝不入库）
+mentorust-gui.ini
+mentorust.log
+mentorust.stop
+*.bak
+*.old
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

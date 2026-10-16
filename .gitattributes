@@ -1,0 +1,16 @@
+# Normalise line endings for cross-platform checkouts
+* text=auto eol=lf
+
+# Windows scripts must keep CRLF so cmd.exe parses them correctly
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binaries - never touch
+*.exe binary
+*.dll binary
+*.zip binary
+*.pcap binary
+*.lib binary
+
+# The vendored pcap crate keeps its own upstream licensing
+pcap/LICENSE-* text
