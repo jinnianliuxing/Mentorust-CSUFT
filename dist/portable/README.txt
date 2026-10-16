@@ -75,3 +75,8 @@ Mentorust 靠 Npcap 收发 802.1X 认证帧，没有它无法工作。
   · 程序本身：直接删掉整个文件夹即可，没有任何系统残留
   · 如果勾过「开机自启动」：先在界面里取消勾选，再删文件夹
   · Npcap 要单独卸载：控制面板 → 程序和功能 → Npcap → 卸载
+
+
+【项目主页 / 源码 / 问题反馈】
+----------------
+https://github.com/jinnianliuxing/Mentorust-CSUFT

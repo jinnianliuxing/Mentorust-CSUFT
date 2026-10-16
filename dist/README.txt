@@ -92,4 +92,4 @@ A: 不需要。普通用户即可安装和运行。
 
 
 项目主页 / 源码 / 问题反馈：
-https://github.com/<你的用户名>/Mentorust-CSUFT
+https://github.com/jinnianliuxing/Mentorust-CSUFT

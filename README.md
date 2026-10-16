@@ -145,10 +145,10 @@ mentorust print-mac                     # 列出本机网卡名称与 MAC
     ├── mentorust.exe           # 脱敏主程序（两个包共用）
     ├── install.bat / uninstall.bat / README.txt    # 安装版脚本
     ├── Mentorust-CSUFT-v0.1.0-win64.zip            # 安装版包
-    └── portable/               # 便携版
+    ├── Mentorust-CSUFT-portable.zip                # 便携版包
+    └── portable/               # 便携版脚本源
         ├── run.bat             # 启动器：自动检测 Npcap（纯 ASCII，避免 cmd 乱码）
-        ├── README.txt          # 便携版中文说明（UTF-8 带 BOM）
-        └── Mentorust-CSUFT-portable.zip            # 便携版包
+        └── README.txt          # 便携版中文说明（UTF-8 带 BOM）
 ```
 
 ---
