@@ -26,6 +26,10 @@ use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::Shell::{
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW, Shell_NotifyIconW,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::PCWSTR;
 
@@ -98,6 +102,21 @@ static AUTO_CONNECT: Mutex<bool> = Mutex::new(false);
 /// 手动双击 exe 时即便勾了「自动连接」也只开界面（不擅自联网）。
 static STARTUP_LAUNCH: AtomicBool = AtomicBool::new(false);
 
+// ===== 托盘运行态 =====
+/// 当前是否真的能上网（决定托盘图标颜色 / 提示文字）
+static ONLINE: AtomicBool = AtomicBool::new(false);
+/// 托盘图标是否已经挂上
+static TRAY_ADDED: AtomicBool = AtomicBool::new(false);
+/// 托盘当前展示的在线状态，用来「变了才刷新」，避免每 3 秒空转一次 shell 调用
+static TRAY_SHOWN_ONLINE: AtomicBool = AtomicBool::new(false);
+/// 两个图标的 HICON（首次用时创建，之后复用；0 = 还没建）
+static ICON_ON: AtomicIsize = AtomicIsize::new(0);
+static ICON_OFF: AtomicIsize = AtomicIsize::new(0);
+/// 是否正在退出 —— 置位后点 X 不再拦截
+static EXITING: AtomicBool = AtomicBool::new(false);
+/// 「已最小化到托盘」的提示只弹一次，不然每次关窗都打扰
+static TRAY_HINTED: AtomicBool = AtomicBool::new(false);
+
 /// `main` 识别到 `--startup` 时调用：标记本次为开机自启动拉起。
 pub fn set_startup_launch(on: bool) {
     STARTUP_LAUNCH.store(on, Ordering::SeqCst);
@@ -158,16 +177,27 @@ fn load_config() -> Cfg {
                 nic: String::new(),
                 autoconnect: false,
             };
+            let mut legacy_plain = false;
             for line in txt.lines() {
                 if let Some(v) = line.strip_prefix("user=") {
                     c.user = v.trim().to_string();
+                } else if let Some(v) = line.strip_prefix("pass_enc=") {
+                    if let Some(p) = crate::pass_decrypt(v) {
+                        c.pass = p;
+                    }
                 } else if let Some(v) = line.strip_prefix("pass=") {
                     c.pass = v.trim().to_string();
+                    legacy_plain = !c.pass.is_empty();
                 } else if let Some(v) = line.strip_prefix("nic=") {
                     c.nic = v.trim().to_string();
                 } else if let Some(v) = line.strip_prefix("autoconnect=") {
                     c.autoconnect = v.trim() == "1";
                 }
+            }
+            if legacy_plain {
+                // 明文口令已落过盘 —— 立刻换成密文，不等用户下次点「连接」
+                save_config(&c.user, &c.pass, &c.nic, c.autoconnect);
+                log::info!("[SEC] ini 里发现明文口令，已就地改写为 DPAPI 密文");
             }
             if !c.user.is_empty() {
                 return c;
@@ -184,16 +214,29 @@ fn load_config() -> Cfg {
 
 fn save_config(user: &str, pass: &str, nic: &str, autoconnect: bool) {
     if let Some(p) = config_path() {
-        let _ = std::fs::write(
-            p,
-            format!(
-                "user={}\npass={}\nnic={}\nautoconnect={}\n",
-                user,
-                pass,
-                nic,
-                if autoconnect { 1 } else { 0 }
-            ),
-        );
+        // 口令只落 DPAPI 密文：ini 拷到别的机器 / 别的账户都解不开
+        if let Some(enc) = crate::pass_encrypt(pass) {
+            let _ = std::fs::write(
+                p,
+                format!(
+                    "user={}\npass_enc={}\nnic={}\nautoconnect={}\n",
+                    user,
+                    enc,
+                    nic,
+                    if autoconnect { 1 } else { 0 }
+                ),
+            );
+        } else {
+            let _ = std::fs::write(
+                p,
+                format!(
+                    "user={}\nnic={}\nautoconnect={}\n",
+                    user,
+                    nic,
+                    if autoconnect { 1 } else { 0 }
+                ),
+            );
+        }
     }
 }
 
@@ -372,6 +415,8 @@ unsafe fn pump(parent: HWND) {
         }
     }
     refresh_info(parent);
+    // 托盘图标 / 提示文字跟着在线状态走（隐藏到托盘后也在更新）
+    sync_tray(parent);
 }
 
 /// 把「状态 · 最新消息」拼成一行写进信息栏
@@ -636,6 +681,252 @@ fn start_disconnect(parent: HWND) {
     });
 }
 
+// ===== 系统托盘 =====
+//
+// 交互约定（与常见桌面软件一致）：
+//   点 X            → 隐藏到托盘，后台认证 + 心跳继续跑，网络不断
+//   双击 / 左键单击 → 打开主界面
+//   右键            → 菜单：打开主界面 / 立即连接 / 断开连接 / 退出
+//   「退出」        → 注销会话 + 结束后台认证进程 + 关闭本程序（保活一起停）
+
+/// 托盘图标的回调消息（lParam = 鼠标消息，wParam = 图标 ID）
+const WM_TRAY: u32 = WM_APP + 2;
+/// 退出清理做完 → 回到 UI 线程销毁窗口
+const WM_APP_QUIT: u32 = WM_APP + 3;
+
+const TRAY_ID: u32 = 1;
+
+// 菜单项 ID 与控件 ID 同在 WM_COMMAND 里分发，所以用同一种类型 i32
+const IDM_SHOW: i32 = 2001;
+const IDM_CONNECT: i32 = 2002;
+const IDM_DISCONNECT: i32 = 2003;
+const IDM_EXIT: i32 = 2004;
+
+fn tray_tip(online: bool) -> &'static str {
+    if online {
+        "Mentorust · 已连接（后台保活中）"
+    } else {
+        "Mentorust · 未连接"
+    }
+}
+
+/// 在内存里画一个 32×32 圆点图标 —— 省掉 .ico 资源和 build script，
+/// 最终 exe 仍然只有一个文件。
+///
+/// 返回 `CreateIconFromResourceEx` 要的「单个图标资源」格式：
+/// BITMAPINFOHEADER(40B) + BGRA 像素（自下而上）+ AND 掩码。
+fn icon_bits(r: u8, g: u8, b: u8) -> Vec<u8> {
+    const S: i32 = 32;
+    let mut v: Vec<u8> = Vec::with_capacity(40 + (S * S * 4) as usize + (S * 4) as usize);
+
+    // BITMAPINFOHEADER：biHeight 要写成「高 × 2」（XOR 像素图 + AND 掩码）
+    for x in [40i32, S, S * 2] {
+        v.extend_from_slice(&(x as u32).to_le_bytes());
+    }
+    v.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+    v.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+    for _ in 0..6 {
+        // biCompression=BI_RGB, biSizeImage, biXPelsPerMeter, biYPelsPerMeter,
+        // biClrUsed, biClrImportant —— 全 0
+        v.extend_from_slice(&0u32.to_le_bytes());
+    }
+
+    // 像素：自下而上，BGRA。半径 13，最外 1.5px 用 alpha 渐变做抗锯齿。
+    let c = (S as f32 - 1.0) / 2.0;
+    for y in (0..S).rev() {
+        for x in 0..S {
+            let d = ((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt();
+            let a = if d <= 12.0 {
+                255.0
+            } else if d >= 13.5 {
+                0.0
+            } else {
+                (13.5 - d) / 1.5 * 255.0
+            };
+            // 外圈压暗一点，缩到 16px 显示时也有立体感、不至于糊成一坨
+            let k = if d > 11.2 { 0.76 } else { 1.0 };
+            v.push((b as f32 * k) as u8);
+            v.push((g as f32 * k) as u8);
+            v.push((r as f32 * k) as u8);
+            v.push(a as u8);
+        }
+    }
+    // AND 掩码：32 位/行 = 4 字节，共 S 行，全 0（带 alpha 的图不看掩码）
+    v.resize(v.len() + (S * 4) as usize, 0);
+    v
+}
+
+/// 取（首次则创建）指定状态的托盘图标
+unsafe fn tray_icon(online: bool) -> HICON {
+    let slot = if online { &ICON_ON } else { &ICON_OFF };
+    let cached = slot.load(Ordering::SeqCst);
+    if cached != 0 {
+        return HICON(cached as *mut c_void);
+    }
+    // 绿 = 已连接，灰 = 未连接（红绿在托盘小图标上区分度不如绿/灰）
+    let (r, g, b) = if online {
+        (0x2eu8, 0xc4u8, 0x74u8)
+    } else {
+        (0x9au8, 0xa0u8, 0xa6u8)
+    };
+    let bits = icon_bits(r, g, b);
+    let icon = CreateIconFromResourceEx(&bits, BOOL(1), 0x0003_0000, 32, 32, LR_DEFAULTCOLOR)
+        .unwrap_or(HICON(ptr::null_mut()));
+    slot.store(icon.0 as isize, Ordering::SeqCst);
+    icon
+}
+
+/// 组装一份 NOTIFYICONDATAW（字段多，集中填一次）
+unsafe fn tray_data(hwnd: HWND, online: bool) -> NOTIFYICONDATAW {
+    let mut nid = NOTIFYICONDATAW::default();
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = TRAY_ID;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAY;
+    nid.hIcon = tray_icon(online);
+    let w: Vec<u16> = tray_tip(online).encode_utf16().collect();
+    let n = w.len().min(nid.szTip.len() - 1);
+    nid.szTip[..n].copy_from_slice(&w[..n]);
+    nid
+}
+
+/// 挂上托盘图标（窗口建好后调用一次）
+unsafe fn tray_add(hwnd: HWND) {
+    if TRAY_ADDED.load(Ordering::SeqCst) {
+        return;
+    }
+    let online = ONLINE.load(Ordering::SeqCst);
+    let nid = tray_data(hwnd, online);
+    if Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
+        TRAY_ADDED.store(true, Ordering::SeqCst);
+        TRAY_SHOWN_ONLINE.store(online, Ordering::SeqCst);
+        log::info!("[TRAY] 托盘图标已挂上（点 X 最小化到托盘，退出走右键菜单）");
+    } else {
+        log::warn!("[TRAY] 托盘图标挂载失败（Shell_NotifyIcon 返回 false）");
+    }
+}
+
+/// 在线状态变了才刷新图标与提示文字
+unsafe fn sync_tray(hwnd: HWND) {
+    if !TRAY_ADDED.load(Ordering::SeqCst) {
+        return;
+    }
+    let online = ONLINE.load(Ordering::SeqCst);
+    if online == TRAY_SHOWN_ONLINE.load(Ordering::SeqCst) {
+        return;
+    }
+    let nid = tray_data(hwnd, online);
+    if Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() {
+        TRAY_SHOWN_ONLINE.store(online, Ordering::SeqCst);
+    }
+}
+
+unsafe fn tray_remove(hwnd: HWND) {
+    if !TRAY_ADDED.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let nid = tray_data(hwnd, false);
+    let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
+/// 托盘气泡提示（"已最小化到托盘"这类一次性说明用）
+unsafe fn tray_balloon(hwnd: HWND, title: &str, text: &str) {
+    if !TRAY_ADDED.load(Ordering::SeqCst) {
+        return;
+    }
+    let mut nid = tray_data(hwnd, ONLINE.load(Ordering::SeqCst));
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;
+    let t: Vec<u16> = title.encode_utf16().collect();
+    let n = t.len().min(nid.szInfoTitle.len() - 1);
+    nid.szInfoTitle[..n].copy_from_slice(&t[..n]);
+    let m: Vec<u16> = text.encode_utf16().collect();
+    let n = m.len().min(nid.szInfo.len() - 1);
+    nid.szInfo[..n].copy_from_slice(&m[..n]);
+    nid.Anonymous.uTimeout = 6000;
+    let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+/// 从托盘唤回主界面（窗口只是隐藏了，控件状态都还在）
+unsafe fn show_main(hwnd: HWND) {
+    let _ = ShowWindow(hwnd, SW_SHOW);
+    let _ = SetForegroundWindow(hwnd);
+}
+
+/// 托盘右键菜单
+unsafe fn tray_menu(hwnd: HWND) {
+    let Ok(menu) = CreatePopupMenu() else {
+        return;
+    };
+    let online = ONLINE.load(Ordering::SeqCst);
+    let busy = BUSY.load(Ordering::SeqCst);
+
+    let s_show = wide("打开主界面");
+    let s_conn = wide("立即连接");
+    let s_disc = wide("断开连接");
+    let s_exit = wide("退出（并断开认证）");
+
+    let _ = AppendMenuW(menu, MF_STRING, IDM_SHOW as usize, PCWSTR(s_show.as_ptr()));
+    // 已在线就没必要再「连接」；正在连接/断开时两项都置灰，避免重复触发
+    let f_conn = if online || busy {
+        MENU_ITEM_FLAGS(MF_STRING.0 | MF_GRAYED.0)
+    } else {
+        MF_STRING
+    };
+    let _ = AppendMenuW(menu, f_conn, IDM_CONNECT as usize, PCWSTR(s_conn.as_ptr()));
+    let f_disc = if busy {
+        MENU_ITEM_FLAGS(MF_STRING.0 | MF_GRAYED.0)
+    } else {
+        MF_STRING
+    };
+    let _ = AppendMenuW(menu, f_disc, IDM_DISCONNECT as usize, PCWSTR(s_disc.as_ptr()));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, PCWSTR(s_exit.as_ptr()));
+
+    // TrackPopupMenu 之前必须把窗口提到前台，否则点到菜单外面菜单不消失
+    // （微软文档明确要求 SetForegroundWindow + 事后 PostMessage(WM_NULL)）
+    let mut pt = windows::Win32::Foundation::POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let _ = SetForegroundWindow(hwnd);
+    let _ = TrackPopupMenu(
+        menu,
+        TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON,
+        pt.x,
+        pt.y,
+        0,
+        hwnd,
+        None,
+    );
+    let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+    let _ = DestroyMenu(menu);
+}
+
+/// 「退出」：注销会话 → 结束后台认证进程 → 关窗口。
+///
+/// 这是唯一会真的停掉保活并断网的入口。点 X 只是藏到托盘，两件事必须分开，
+/// 否则用户关个窗口就把网断了。
+unsafe fn tray_exit(hwnd: HWND) {
+    if EXITING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tray_remove(hwnd);
+    let nic = current_nic();
+    say_status("○ 正在退出...");
+    log::info!("[TRAY] 从托盘退出：注销会话并结束后台保活");
+    thread::spawn(move || {
+        // logoff() 内部先 kill_ghosts()、再向 BRAS 发 EAPOL-Logoff。
+        // 不注销直接杀进程会留下半开坏会话，下次要等 BRAS 超时才连得上。
+        crate::logoff(&nic);
+        let h = MAIN_HWND.load(Ordering::SeqCst);
+        if h != 0 {
+            unsafe {
+                let _ = PostMessageW(HWND(h as *mut c_void), WM_APP_QUIT, WPARAM(0), LPARAM(0));
+            }
+        }
+    });
+}
+
 // ===== 窗口过程 =====
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -683,6 +974,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     }
                 }
+                // ---- 托盘菜单项 ----
+                IDM_SHOW => show_main(hwnd),
+                IDM_CONNECT => {
+                    show_main(hwnd); // 先亮出界面，让用户看到"连接中..."
+                    start_connect(hwnd);
+                }
+                IDM_DISCONNECT => start_disconnect(hwnd),
+                IDM_EXIT => tray_exit(hwnd),
                 _ => {}
             }
             LRESULT(0)
@@ -691,8 +990,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             pump(hwnd);
             LRESULT(0)
         }
-        WM_CLOSE => {
+        // 托盘图标被点：lParam 是鼠标消息
+        WM_TRAY => {
+            match lparam.0 as u32 {
+                WM_LBUTTONUP | WM_LBUTTONDBLCLK => show_main(hwnd),
+                WM_RBUTTONUP | WM_CONTEXTMENU => tray_menu(hwnd),
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        // 退出流程已注销会话、停掉后台进程 → 这里才真的销毁窗口
+        WM_APP_QUIT => {
+            tray_remove(hwnd);
             let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            if EXITING.load(Ordering::SeqCst) {
+                let _ = DestroyWindow(hwnd);
+            } else {
+                // 点 X = 藏到托盘，后台认证 / 心跳继续跑，网络不受影响。
+                // 要真的停下来（并断网）走托盘菜单的「退出」。
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                if !TRAY_HINTED.swap(true, Ordering::SeqCst) {
+                    tray_balloon(
+                        hwnd,
+                        "Mentorust 仍在后台保活",
+                        "窗口已收到托盘，网络不会断。要彻底退出（含断开认证），请右键托盘图标 →「退出」。",
+                    );
+                }
+            }
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -751,9 +1078,12 @@ pub fn run() {
 
         let cls = wide(CLASS_NAME);
 
-        // 单实例：已有窗口则把它提到前台，然后退出
+        // 单实例：已有窗口则把它提到前台，然后退出。
+        // 注意必须 ShowWindow —— 窗口可能正藏在托盘里（隐藏态下 SetForegroundWindow 没效果，
+        // 用户会以为"双击没反应"）。
         if let Ok(old) = FindWindowW(PCWSTR(cls.as_ptr()), PCWSTR::null()) {
             if !old.0.is_null() {
+                let _ = ShowWindow(old, SW_SHOW);
                 let _ = SetForegroundWindow(old);
                 return;
             }
@@ -857,6 +1187,8 @@ pub fn run() {
         set_text(hwnd, ID_PASS, &cfg_pass);
 
         let _ = ShowWindow(hwnd, SW_SHOW);
+        // 挂托盘图标：关窗后程序仍在此驻留（图标 + 菜单是唯一入口）
+        tray_add(hwnd);
         say_status("○ 未连接");
         say_log("填好账号密码点「连接」");
 
@@ -876,6 +1208,7 @@ pub fn run() {
         // 启动时立刻探测一次当前状态（只刷状态，不覆盖上面那句提示）
         thread::spawn(|| {
             let online = crate::campus_online(&current_nic());
+            ONLINE.store(online, Ordering::SeqCst);
             say_status(if online { "● 已连接" } else { "○ 未连接" });
         });
 
@@ -892,6 +1225,7 @@ pub fn run() {
                     continue; // 正在手动连接/断开，别抢状态栏
                 }
                 let online = crate::campus_online(&current_nic());
+                ONLINE.store(online, Ordering::SeqCst);
                 if online {
                     down_strikes = 0;
                 } else {

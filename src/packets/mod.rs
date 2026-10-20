@@ -146,6 +146,11 @@ impl EchoState {
         self.key
     }
 
+    /// 当前待发的序号（`fill()` 之前读，就是这一帧实际用的 seq）。
+    pub fn no(&self) -> u32 {
+        self.no
+    }
+
     /// 把当前这一帧的 echo 数据写进整帧缓冲，然后序号自增。
     ///
     /// `frame` 是含以太网头的完整帧，所以 0x18 / 0x22 可以直接当下标用。

@@ -97,17 +97,45 @@ fn set_stop_flag(on: bool) {
 // 写 exe 同目录的 mentorust.log，超过 1MB 自动滚动成 mentorust.log.1。
 // 同时仍输出到 stderr，前台运行时能立刻看到。
 static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
+/// 日志文件路径（轮转时要用）与累计行数（每 100 行触发一次体积检查）。
+static LOG_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+static LOG_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct SimpleLogger;
 
-/// 本地时间 HH:MM:SS（本机固定 UTC+8，中国大陆无夏令时，无需时区库）
-fn now_hms() -> String {
+/// 本地时间 YYYY-MM-DD HH:MM:SS（本机固定 UTC+8，中国大陆无夏令时，无需时区库）
+///
+/// 以前只打 HH:MM:SS：日志会连续累积很多天，事后无法判断某条记录
+/// 属于哪一天，跨天分析只能靠猜测（2026-10-20 分析时整体偏了 7 天）。
+fn now_stamp() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let local = secs + 8 * 3600;
-    format!("{:02}:{:02}:{:02}", (local / 3600) % 24, (local / 60) % 60, local % 60)
+    let (y, mo, d) = civil_from_days((local / 86_400) as i64);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        y, mo, d,
+        (local / 3600) % 24,
+        (local / 60) % 60,
+        local % 60
+    )
+}
+
+/// 由「1970-01-01 起的整日数」反算年月日（Howard Hinnant civil_from_days 算法）。
+/// 纯整数运算，不引入 chrono，避免为一个时间戳多背一个依赖。
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    ((if m <= 2 { y + 1 } else { y }) as i32, m, d)
 }
 
 impl log::Log for SimpleLogger {
@@ -118,12 +146,17 @@ impl log::Log for SimpleLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        let line = format!("{} {:<5} {}\n", now_hms(), record.level(), record.args());
+        let line = format!("{} {:<5} {}\n", now_stamp(), record.level(), record.args());
         if let Ok(mut guard) = LOG_FILE.lock() {
             if let Some(f) = guard.as_mut() {
                 let _ = f.write_all(line.as_bytes());
                 let _ = f.flush();
             }
+        }
+        // 每 100 行查一次体积：只在 init 时查的话，进程连跑几天
+        // （掉线重试循环能刷出上千行/天）会把更早的证据直接冲掉。
+        if LOG_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100 == 0 {
+            maybe_rotate_log();
         }
         let _ = std::io::stderr().write_all(line.as_bytes());
     }
@@ -142,10 +175,8 @@ fn init_logging() {
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("mentorust.log")));
     if let Some(p) = path {
-        if let Ok(md) = std::fs::metadata(&p) {
-            if md.len() > 1_000_000 {
-                let _ = std::fs::rename(&p, p.with_extension("log.1"));
-            }
+        if let Ok(mut g) = LOG_PATH.lock() {
+            *g = Some(p.clone());
         }
         if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
             if let Ok(mut g) = LOG_FILE.lock() {
@@ -155,6 +186,34 @@ fn init_logging() {
     }
     let _ = log::set_logger(&SimpleLogger);
     log::set_max_level(log::LevelFilter::Info);
+}
+
+/// 日志超过 2 MB 就滚动：mentorust.log -> .log.1 -> .log.2（保留两份）。
+/// Windows 上必须先放掉文件句柄才能改名，所以这里显式置 None 再重开。
+fn maybe_rotate_log() {
+    let path = match LOG_PATH.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => None,
+    };
+    let path = match path {
+        Some(p) => p,
+        None => return,
+    };
+    let too_big = std::fs::metadata(&path).map(|m| m.len() > 2_000_000).unwrap_or(false);
+    if !too_big {
+        return;
+    }
+    if let Ok(mut g) = LOG_FILE.lock() {
+        *g = None;
+    }
+    let _ = std::fs::remove_file(path.with_extension("log.2"));
+    let _ = std::fs::rename(path.with_extension("log.1"), path.with_extension("log.2"));
+    let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut g) = LOG_FILE.lock() {
+            *g = Some(f);
+        }
+    }
 }
 
 /// 把 stdout/stderr 接回父进程的控制台。
@@ -206,6 +265,11 @@ fn main() {
     #[cfg(target_os = "windows")]
     attach_parent_console();
     init_logging();
+    // release 编成 panic=abort：未捕获的 panic 会让进程无声消失，
+    // 日志里一个字都不留，事后完全无法区分「崩了」还是「被杀了」。
+    std::panic::set_hook(Box::new(|info| {
+        error!("[PANIC] 认证进程异常终止: {}", info);
+    }));
 
     // Ghost instance: hidden background worker spawned by the launcher.
     // Takes a single-instance lock, then authenticates and keeps the
@@ -231,6 +295,16 @@ fn main() {
                 .and_then(|i| argv.get(i + 1))
                 .cloned()
         };
+        // 凭据可由 GUI 通过**匿名管道**（本进程 stdin）传入，不落命令行 ——
+        // 命令行参数在同用户权限下任何进程都能读到（Win32_Process.CommandLine）。
+        let (mut cred_user, mut cred_pass) = (None, None);
+        if argv.iter().any(|a| a == "--cred-stdin") {
+            #[cfg(target_os = "windows")]
+            if let Some((u, p)) = read_cred_stdin() {
+                cred_user = Some(u);
+                cred_pass = Some(p);
+            }
+        }
         // 用户手动点过「断开」→ 处于"停用"状态，任何自动路径都不许再联网。
         // 必须显式点「连接」（会清掉这个标记）才会重新认证。
         if stop_flag_set() {
@@ -241,12 +315,13 @@ fn main() {
         let nic = opt("--gui-nic")
             .filter(|s| !s.is_empty())
             .unwrap_or_else(saved_nic);
-        let user = opt("--gui-user")
-            .filter(|s| !s.is_empty())
+        let user = cred_user
+            .or_else(|| opt("--gui-user").filter(|s| !s.is_empty()))
             .or_else(|| saved_cred("user"))
             .unwrap_or_else(|| DEFAULT_USER.to_string());
-        let pass = opt("--gui-pass")
-            .filter(|s| !s.is_empty())
+        // 不再接受 `--gui-pass`：明文口令一旦进命令行，同用户下任何进程
+        // 枚举 CommandLine 就能读到。只认管道（--cred-stdin）与 ini 密文。
+        let pass = cred_pass
             .or_else(|| saved_cred("pass"))
             .unwrap_or_else(|| DEFAULT_PASS.to_string());
         auth(nic, user, pass, DEFAULT_DHCP_MODE);
@@ -423,6 +498,74 @@ fn saved_nic() -> String {
     DEFAULT_NIC.to_string()
 }
 
+/// 用 Windows DPAPI 加密口令（**当前用户**作用域），返回十六进制串。
+///
+/// 只在这台机器的这个 Windows 用户下解得开：ini 被拷走、被别的账户读到，
+/// 拿到的也只是一串密文。`CRYPTPROTECT_UI_FORBIDDEN`(0x1) 保证后台
+/// 无人值守时绝不弹认证框。
+#[cfg(target_os = "windows")]
+pub fn pass_encrypt(plain: &str) -> Option<String> {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
+    if plain.is_empty() {
+        return None;
+    }
+    let mut data = plain.as_bytes().to_vec();
+    let bin = CRYPT_INTEGER_BLOB {
+        cbData: data.len() as u32,
+        pbData: data.as_mut_ptr(),
+    };
+    let mut out = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    unsafe {
+        if CryptProtectData(
+            &bin,
+            windows::core::PCWSTR::null(),
+            None,
+            None,
+            None,
+            0x1,
+            &mut out,
+        )
+        .is_err()
+        {
+            return None;
+        }
+        let buf = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+        let _ = LocalFree(HLOCAL(out.pbData as *mut core::ffi::c_void));
+        Some(hex::encode(buf))
+    }
+}
+
+/// 解开 `pass_encrypt` 写下的密文；换机器 / 换用户 / 密文被篡改都返回 None。
+#[cfg(target_os = "windows")]
+pub fn pass_decrypt(enc: &str) -> Option<String> {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
+    let mut data = hex::decode(enc.trim()).ok()?;
+    if data.is_empty() {
+        return None;
+    }
+    let bin = CRYPT_INTEGER_BLOB {
+        cbData: data.len() as u32,
+        pbData: data.as_mut_ptr(),
+    };
+    let mut out = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    unsafe {
+        if CryptUnprotectData(&bin, None, None, None, None, 0x1, &mut out).is_err() {
+            return None;
+        }
+        let buf = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+        let _ = LocalFree(HLOCAL(out.pbData as *mut core::ffi::c_void));
+        String::from_utf8(buf).ok()
+    }
+}
+
 /// 读 exe 同目录 `mentorust-gui.ini` 里的某个键（user / pass）。
 /// 发布版不含内置账号，`--ghost` / 开机自启都靠它拿到用户保存的凭据。
 #[allow(dead_code)]
@@ -432,6 +575,16 @@ fn saved_cred(key: &str) -> Option<String> {
         .and_then(|e| e.parent().map(|d| d.join("mentorust-gui.ini")));
     let p = path?;
     let txt = std::fs::read_to_string(&p).ok()?;
+    // 口令存的是 DPAPI 密文（`pass_enc=`）；老的明文 `pass=` 仅在迁移期兜底。
+    if key == "pass" {
+        for line in txt.lines() {
+            if let Some(v) = line.strip_prefix("pass_enc=") {
+                if let Some(plain) = pass_decrypt(v) {
+                    return Some(plain);
+                }
+            }
+        }
+    }
     let prefix = format!("{}=", key);
     for line in txt.lines() {
         if let Some(v) = line.strip_prefix(&prefix) {
@@ -452,36 +605,137 @@ fn spawn_ghost() {
     spawn_ghost_with(&user, &pass, &saved_nic())
 }
 
-/// 启动后台认证进程，并带上指定的账号密码 / 网卡
+/// 从 stdin 读两行凭据（`user\npass\n`）——GUI 通过匿名管道传入，**不经过命令行**。
+/// 读不到（父进程没写就退出 / 管道已关）返回 None，调用方回落到 ini。
+#[cfg(target_os = "windows")]
+fn read_cred_stdin() -> Option<(String, String)> {
+    use std::io::BufRead;
+    let stdin = std::io::stdin();
+    let mut lock = stdin.lock();
+    let mut u = String::new();
+    let mut p = String::new();
+    if lock.read_line(&mut u).ok()? == 0 {
+        return None;
+    }
+    if lock.read_line(&mut p).ok()? == 0 {
+        return None;
+    }
+    let u = u.trim_end_matches(['\r', '\n']).to_string();
+    let p = p.trim_end_matches(['\r', '\n']).to_string();
+    if u.is_empty() || p.is_empty() {
+        return None;
+    }
+    Some((u, p))
+}
+
+/// 启动后台认证进程，带上网卡。
+///
+/// **凭据不进命令行**：账号密码通过匿名管道写进子进程的 stdin
+/// （子进程带 `--cred-stdin`），命令行里只剩 `--ghost --gui-nic "..."`。
+/// 以前是 `--gui-pass "明文"`，同用户权限下任何进程枚举进程命令行
+/// 都能直接读到口令。
 #[cfg(target_os = "windows")]
 fn spawn_ghost_with(user: &str, pass: &str, nic: &str) {
+    use windows::Win32::Foundation::{
+        CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT,
+    };
+    use windows::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileA, WriteFile, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_SHARE_MODE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Pipes::CreatePipe;
+    use windows::Win32::System::Threading::STARTF_USESTDHANDLES;
+
     let current_exe = std::env::current_exe().expect("Failed to get current executable path");
-    let command_line = CString::new(format!(
-        "\"{}\" --ghost --gui-user \"{}\" --gui-pass \"{}\" --gui-nic \"{}\"",
-        current_exe.display(),
-        user,
-        pass,
-        nic
-    ))
-    .expect("Failed to convert command line to CString");
+
     unsafe {
+        // ---- 1) 匿名管道：读端给子进程，写端留给自己且**不可继承** ----
+        // 写端若被子进程继承，它自己也持有一份写句柄，父进程关掉后它等不到 EOF。
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: ptr::null_mut(),
+            bInheritHandle: BOOL(1),
+        };
+        let (mut rd, mut wr) = (HANDLE::default(), HANDLE::default());
+        let piped = CreatePipe(&mut rd, &mut wr, Some(&sa), 0).is_ok();
+        if piped {
+            let _ = SetHandleInformation(wr, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
+        }
+
+        // ---- 2) 命令行：只有管道建成功才带 --cred-stdin，否则子进程会死等 stdin ----
+        let cmd = if piped {
+            format!("\"{}\" --ghost --gui-nic \"{}\" --cred-stdin", current_exe.display(), nic)
+        } else {
+            format!("\"{}\" --ghost --gui-nic \"{}\"", current_exe.display(), nic)
+        };
+        let command_line = match CString::new(cmd) {
+            Ok(c) => c,
+            Err(_) => {
+                error!("命令行含 NUL 字节，后台进程未启动");
+                return;
+            }
+        };
+
         let mut startup_info = STARTUPINFOA::default();
+        startup_info.cb = std::mem::size_of::<STARTUPINFOA>() as u32;
+        let mut nul = HANDLE::default();
+        if piped {
+            // stdout/stderr 指到 NUL：否则子进程继承到无效句柄，写 stderr 会失败
+            if let Ok(h) = CreateFileA(
+                PCSTR(b"NUL\0".as_ptr()),
+                FILE_GENERIC_WRITE.0,
+                FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0),
+                None,
+                OPEN_EXISTING,
+                Default::default(),
+                HANDLE(ptr::null_mut()),
+            ) {
+                nul = h;
+            }
+            startup_info.dwFlags = STARTF_USESTDHANDLES;
+            startup_info.hStdInput = rd;
+            startup_info.hStdOutput = nul;
+            startup_info.hStdError = nul;
+        }
+
         let mut process_info = PROCESS_INFORMATION::default();
-        startup_info.cb = size_of::<STARTUPINFOA>() as u32;
         let success = CreateProcessA(
             PCSTR::null(),
             PSTR(command_line.as_ptr() as *mut _),
             None,
             None,
-            false,
+            BOOL(if piped { 1 } else { 0 }),
             CREATE_NO_WINDOW,
             None,
             PCSTR::null(),
-            &mut startup_info,
+            &startup_info,
             &mut process_info,
         );
+
+        // ---- 3) 写凭据后立刻关掉写端：子进程读到两行就继续 ----
+        if piped {
+            let mut payload = Vec::with_capacity(user.len() + pass.len() + 2);
+            payload.extend_from_slice(user.as_bytes());
+            payload.push(b'\n');
+            payload.extend_from_slice(pass.as_bytes());
+            payload.push(b'\n');
+            let mut written = 0u32;
+            let _ = WriteFile(wr, Some(&payload), Some(&mut written), None);
+            for b in payload.iter_mut() {
+                *b = 0; // 尽力把明文从这块堆内存抹掉
+            }
+            let _ = CloseHandle(wr);
+            let _ = CloseHandle(rd);
+            if !nul.0.is_null() {
+                let _ = CloseHandle(nul);
+            }
+        }
+
         if success.is_ok() {
             info!("后台认证进程已启动，PID: {}", process_info.dwProcessId);
+            let _ = CloseHandle(process_info.hProcess);
+            let _ = CloseHandle(process_info.hThread);
         } else {
             error!("启动后台进程失败: {}", windows::core::Error::from_win32());
         }
@@ -884,6 +1138,15 @@ fn auth(
     let mut retry_at = Instant::now();         // 退避期的"可重试时刻"
     let mut backoff = FAIL_WAIT;
     let mut last_heartbeat = Instant::now();
+    // 本次会话起点与序号：掉线时能直接报「这一轮活了多久」，
+    // 不必再靠外部脚本从日志里反推 60 分钟周期。
+    let mut session_start = Instant::now();
+    let mut session_no: u64 = 0;
+    // 探测统计与 IP 基线（每 60 秒落一条，用来判断掉线前是否已在抖动）。
+    let mut probe_ok: u64 = 0;
+    let mut probe_fail: u64 = 0;
+    let mut last_ip: Option<std::net::Ipv4Addr> = None;
+    let mut last_probe_report = Instant::now();
     let mut offline_strikes: u32 = 0;
     let mut last_reopen = Instant::now();
     let mut settle_until = Instant::now() + AUTH_SETTLE;   // 稳定期截止时刻
@@ -927,6 +1190,9 @@ fn auth(
                     backoff = FAIL_WAIT;
                     retry_at = Instant::now();
                     last_heartbeat = Instant::now();
+                    session_start = Instant::now();
+                    session_no += 1;
+                    info!("[AUTH] 第 {} 次会话开始", session_no);
                     settle_until = Instant::now() + AUTH_SETTLE;
                     // 认证刚成功就立刻补一个心跳：锐捷交换机/BRAS 依赖 0xBF 心跳
                     // 来激活并维持数据通路，越早发越好。
@@ -972,11 +1238,13 @@ fn auth(
             }
 
             if online {
+                probe_ok += 1;
                 if offline_strikes > 0 {
                     info!("校园网已恢复在线。");
                     offline_strikes = 0;
                 }
             } else {
+                probe_fail += 1;
                 offline_strikes = offline_strikes.saturating_add(1);
                 if offline_strikes == 1 {
                     warn!("探测到有线校园网不通，继续观察（连续 {} 次不通才判定掉线）...", OFFLINE_STRIKES);
@@ -993,7 +1261,15 @@ fn auth(
                 }
 
                 if offline_strikes >= OFFLINE_STRIKES {
-                    warn!("确认已掉线，立即重新认证...");
+                    let ip = campus_ipv4_of(&nic_name)
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    warn!(
+                        "[DROP] 确认已掉线：本次会话持续 {:.1} 分，距上次心跳 {:.1}s，IP={}（重新认证）...",
+                        session_start.elapsed().as_secs_f64() / 60.0,
+                        last_heartbeat.elapsed().as_secs_f64(),
+                        ip
+                    );
                     phase_auth = true;
                     last_server = Instant::now();
                     retry_at = Instant::now();
@@ -1001,6 +1277,37 @@ fn auth(
                     let _ = packet_sender.send(Status::ProbeStartAuth { dest_mac });
                 }
             }
+        }
+
+        // 每 60 秒留一条基线。诊断时最需要的三个问题：
+        //   掉线前探测是否已经在抖？IP 是否变过？心跳是否还在按周期走？
+        // 只有周期性样本才能回答，光有「出错时才写」的日志答不出来。
+        if last_probe_report.elapsed() >= Duration::from_secs(60) {
+            let ip = campus_ipv4_of(&nic_name);
+            match (last_ip, ip) {
+                (Some(old), Some(new)) if old != new => {
+                    warn!("[NET] 本机 10.x 地址变化: {} -> {}", old, new);
+                }
+                (Some(old), None) => {
+                    warn!("[NET] 本机 10.x 地址消失（原 {}）", old);
+                }
+                (None, Some(new)) => {
+                    info!("[NET] 本机 10.x 地址: {}", new);
+                }
+                _ => {}
+            }
+            last_ip = ip;
+            info!(
+                "[PROBE] 近 60s 探测 ok={} fail={}，IP={}，会话 {:.1} 分，距心跳 {:.1}s",
+                probe_ok,
+                probe_fail,
+                ip.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string()),
+                session_start.elapsed().as_secs_f64() / 60.0,
+                last_heartbeat.elapsed().as_secs_f64()
+            );
+            probe_ok = 0;
+            probe_fail = 0;
+            last_probe_report = Instant::now();
         }
     }
 }
@@ -1057,6 +1364,10 @@ fn spawn_packet_sender(
         };
         // 锐捷心跳种子：认证成功后从成功包里解出，每次重认证都重置序号。
         let mut echo: Option<packets::EchoState> = None;
+        // 心跳采样计数：每帧都写会刷出 4000+ 行/天，只记首帧与每 5 帧，
+        // 但「序号 + 间隔」都保留 —— 这恰好是判断保活是否失效的两个量。
+        let mut beat_n: u64 = 0;
+        let mut beat_at = Instant::now();
         loop {
             let status = match receiver.recv() {
                 Ok(status) => status,
@@ -1139,8 +1450,19 @@ fn spawn_packet_sender(
                     exit(0);
                 }
                 Status::Heartbeat { dest_mac } => {
+                    beat_n += 1;
+                    let gap = beat_at.elapsed().as_secs_f64();
+                    beat_at = Instant::now();
+                    let seq = echo.as_ref().map(|e| e.no()).unwrap_or(0);
+                    let key = echo.as_ref().map(|e| e.key()).unwrap_or(0);
                     let packet = packets::build_heartbeat_packet(&dest_mac, &local_mac, echo.as_mut());
                     send(packet.as_slice());
+                    if beat_n == 1 || beat_n % 5 == 0 {
+                        info!(
+                            "[BEAT] 心跳 #{} seq=0x{:04X} key=0x{:08X} 距上帧 {:.2}s len={}",
+                            beat_n, seq, key, gap, packet.len()
+                        );
+                    }
                 }
             }
         }
