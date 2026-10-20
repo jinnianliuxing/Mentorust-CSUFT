@@ -919,7 +919,8 @@ fn auth(
                 backoff = (backoff * 2).min(FAIL_WAIT_MAX);
             }
             Ok(status) => {
-                if let Status::AuthSuccess { dest_mac: new_dest_mac } = status {
+                let mut send_heartbeat_now = false;
+                if let Status::AuthSuccess { dest_mac: new_dest_mac, .. } = status {
                     dest_mac = new_dest_mac;
                     phase_auth = false;
                     offline_strikes = 0;
@@ -929,12 +930,19 @@ fn auth(
                     settle_until = Instant::now() + AUTH_SETTLE;
                     // 认证刚成功就立刻补一个心跳：锐捷交换机/BRAS 依赖 0xBF 心跳
                     // 来激活并维持数据通路，越早发越好。
-                    let _ = packet_sender.send(Status::Heartbeat { dest_mac });
+                    //
+                    // 但它必须排在 AuthSuccess **之后**入队：心跳要用成功包里的
+                    // 种子，而 packet_sender 只有先收到 AuthSuccess 才拿得到种子。
+                    // 以前这里先发心跳，导致首帧只能走固定模板。
+                    send_heartbeat_now = true;
                 }
                 if matches!(status, Status::EapRequestIdentity { .. } | Status::EapRequestPassword { .. }) {
                     last_server = Instant::now();
                 }
                 let _ = packet_sender.send(status);
+                if send_heartbeat_now {
+                    let _ = packet_sender.send(Status::Heartbeat { dest_mac });
+                }
             }
             Err(RecvTimeoutError::Disconnected) => {
                 error!("认证器状态接收器已断开，请检查认证器状态接收器是否正常！");
@@ -1047,6 +1055,8 @@ fn spawn_packet_sender(
                 None => warn!("发包句柄暂不可用（下次发包时重建）"),
             }
         };
+        // 锐捷心跳种子：认证成功后从成功包里解出，每次重认证都重置序号。
+        let mut echo: Option<packets::EchoState> = None;
         loop {
             let status = match receiver.recv() {
                 Ok(status) => status,
@@ -1108,8 +1118,18 @@ fn spawn_packet_sender(
                     let packet = packets::build_password_packet(&dest_mac, &local_mac, &ipv4, &ipv6, username.as_str(), password.as_str(), id, &seed[0..seed_len as usize]);
                     send(packet.as_slice());
                 }
-                Status::AuthSuccess { .. } => {
+                Status::AuthSuccess { echo_key, .. } => {
                     info!("认证成功...欢迎来到互联网世界！");
+                    match echo_key {
+                        Some(k) => {
+                            info!("已解出锐捷心跳种子 echo_key={:#010x}，心跳将按序号递增发送", k);
+                            echo = Some(packets::EchoState::new(k));
+                        }
+                        None => {
+                            warn!("成功包里没取到心跳种子，心跳退回固定模板：会话仍可能每 60 分钟超时一次");
+                            echo = None;
+                        }
+                    }
                 }
                 Status::Reconnect => {}
                 Status::AuthFailed { .. } => {
@@ -1119,7 +1139,7 @@ fn spawn_packet_sender(
                     exit(0);
                 }
                 Status::Heartbeat { dest_mac } => {
-                    let packet = packets::build_heartbeat_packet(&dest_mac, &local_mac);
+                    let packet = packets::build_heartbeat_packet(&dest_mac, &local_mac, echo.as_mut());
                     send(packet.as_slice());
                 }
             }
@@ -1208,7 +1228,8 @@ fn start_loop(sc: Arc<SharedCapture>, ipv4: [u8; 4], ipv6: [u8; 16]) -> std::syn
                             }
                         }
                     }
-                    if sender.send(Status::AuthSuccess { dest_mac }).is_err() {
+                    let echo_key = packets::extract_echo_key(data);
+                    if sender.send(Status::AuthSuccess { dest_mac, echo_key }).is_err() {
                         return;
                     }
                 } else if code == CODE_FAILURE {

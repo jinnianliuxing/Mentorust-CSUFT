@@ -112,20 +112,107 @@ pub fn build_password_packet(
     packet.to_vec()
 }
 
+/// 锐捷私有混淆：把一个字节的 8 位颠倒，再按位取反。
+///
+/// 逐字对应 MentoHUST `myfunc.c` 的 `encode()`。心跳的种子与序号都靠它
+/// 混淆；少这一步，BRAS 认不出心跳，会话满 3600 秒被清 -> 每 60 分钟掉线。
+pub fn encode_byte(mut base: u8) -> u8 {
+    let mut result: u8 = 0;
+    for _ in 0..8 {
+        result <<= 1;
+        result |= base & 0x01;
+        base >>= 1;
+    }
+    !result
+}
+
+/// 心跳（EAPOL 0xBF）状态机。
+///
+/// 锐捷心跳不是固定报文：认证成功包里带一个 4 字节种子，之后每发一帧把
+/// 序号 +1，再把 `种子+序号` 与 `序号` 各自 encode 后回填到整帧偏移
+/// 0x18 与 0x22。对应 MentoHUST 的 `getEchoKey()` / `fillEchoPacket()`。
+pub struct EchoState {
+    key: u32,
+    no: u32,
+}
+
+impl EchoState {
+    /// `no` 的初值与 MentoHUST `fillMd5Packet()` 一致。
+    pub fn new(key: u32) -> Self {
+        Self { key, no: 0x0000_102B }
+    }
+
+    pub fn key(&self) -> u32 {
+        self.key
+    }
+
+    /// 把当前这一帧的 echo 数据写进整帧缓冲，然后序号自增。
+    ///
+    /// `frame` 是含以太网头的完整帧，所以 0x18 / 0x22 可以直接当下标用。
+    pub fn fill(&mut self, frame: &mut [u8]) {
+        if frame.len() >= 0x26 {
+            let sum = self.key.wrapping_add(self.no);
+            let no = self.no;
+            for i in 0..4 {
+                let shift = 24 - 8 * i;
+                frame[0x18 + i] = encode_byte((sum >> shift) as u8);
+                frame[0x22 + i] = encode_byte((no >> shift) as u8);
+            }
+        }
+        self.no = self.no.wrapping_add(1);
+    }
+}
+
+/// 从认证成功包（整帧，含以太网头）里取出心跳种子。
+///
+/// 偏移公式来自 MentoHUST `getEchoKey()`：`0x1c + frame[0x1b] + 0x69 + 24`。
+/// 取到 4 字节后逐字节 encode，再当作大端整数 —— 这是原作在小端机上的
+/// 实际语义（值先按小端读、字节反转，再对内存字节逐个 encode），必须原样
+/// 复刻，否则算出的 `种子+序号` 对不上。
+pub fn extract_echo_key(frame: &[u8]) -> Option<u32> {
+    if frame.len() <= 0x1b {
+        return None
+    }
+    let offset = 0x1c + frame[0x1b] as usize + 0x69 + 24;
+    if offset + 4 > frame.len() {
+        return None
+    }
+    let raw = &frame[offset..offset + 4];
+    let key = u32::from_be_bytes([
+        encode_byte(raw[0]),
+        encode_byte(raw[1]),
+        encode_byte(raw[2]),
+        encode_byte(raw[3]),
+    ]);
+    // 全 0 / 全 1 = 取到的是空白区，不是真种子
+    if key == 0 || key == u32::MAX {
+        return None
+    }
+    Some(key)
+}
+
 /// 心跳包
 pub fn build_heartbeat_packet(
     dest_mac: &[u8],
     local_mac: &[u8],
+    echo: Option<&mut EchoState>,
 ) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(16 + 2);
+    let mut packet = Vec::with_capacity(16 + 2 + 30);
     packet.extend_from_slice(&build_eap(dest_mac, local_mac, ETH_P_PAE, VERSION_8021X_2001, TYPE_EAPOL_HEARTBEAT));
 
+    // 模板取自 MentoHUST sendEchoPacket()：偏移 0x18 / 0x22 两处 4 字节是
+    // 变化位，下面会被 EchoState::fill() 改写。这里的初值只在拿不到种子
+    // （回退路径）时生效，所以填的是原厂模板的占位值。
     const ECHO_DATA: [u8; 30] = [
-        0xFF,0xFF,0x37,0x77,0x7F,0x9F,0xF7,0xFF,0x00,0x00,0xFF,0xFF,0x37,0x77,0x7F,
-        0x9F,0xF7,0xFF,0x00,0x00,0xFF,0xFF,0x37,0x77,0x7F,0x3F,0xFF,0x00,0x00,0x00
+        0xFF,0xFF,0x37,0x77,0x7F,0x9F,0xFF,0xFF,0xD9,0x13,0xFF,0xFF,0x37,0x77,0x7F,
+        0x9F,0xFF,0xFF,0xF7,0x2B,0xFF,0xFF,0x37,0x77,0x7F,0x3F,0xFF,0x00,0x00,0x00
     ];
     packet.put_u16(0x1e);
     packet.extend_from_slice(&ECHO_DATA);
+
+    if let Some(state) = echo {
+        state.fill(&mut packet);
+    }
 
     packet
 }

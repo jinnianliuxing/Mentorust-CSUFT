@@ -24,8 +24,12 @@ pub enum Status {
         seed_len: u8,
     },
     /// 认证成功
+    ///
+    /// `echo_key` 是从成功包锐捷私有扩展里解出的心跳种子（已按锐捷算法
+    /// encode 混淆）。`None` = 包结构对不上或偏移越界，心跳只能退回固定模板。
     AuthSuccess {
         dest_mac: [u8; 6],
+        echo_key: Option<u32>,
     },
     /// 重新连接
     Reconnect,
