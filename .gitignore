@@ -19,3 +19,12 @@ Thumbs.db
 dist/Mentorust-CSUFT-portable-npcap.zip
 dist/portable/npcap-*.exe
 npcap-*.exe
+
+# 本地便携运行目录（含 DPAPI 密文、日志、exe 副本、上一版备份）
+# 整个目录不入库；发布用的包由 dist/ 提供。
+portable/
+/mentorust.exe
+*.prev*.exe
+
+# 旧版本源码备份（历史快照，体积大且无价值）
+_bak_*/
