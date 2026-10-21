@@ -409,6 +409,23 @@ fn main() {
     std::env::set_var("RUST_LOG", "info");
     #[cfg(target_os = "windows")]
     attach_parent_console();
+
+    // —— clap 的查询类参数（--version / --help）与参数错误必须在 init_logging
+    //    之前终结：晚一步就会往 GUI 日志写一条多余的 [BOOT]、把 GUI 启动流程
+    //    整个走一遍才退出（2026-10-21 实测：跑一次 --version 多起一个进程）。
+    //    --ghost / --auto / --startup 是内部路径，参数集不走 clap，先放行。
+    let argv: Vec<String> = std::env::args().collect();
+    let internal_path = argv
+        .iter()
+        .any(|a| a == "--ghost" || a == "--auto" || a == "--startup");
+    if !internal_path {
+        // 成功也继续往下走（后面还会正式 parse 一次）；失败时 clap 自己打印
+        // （版本/帮助走 stdout，错误走 stderr）并以对应退出码结束。
+        if let Err(e) = EapArgs::try_parse_from(argv.clone()) {
+            e.exit();
+        }
+    }
+
     init_logging();
     // release 编成 panic=abort：未捕获的 panic 会让进程无声消失，
     // 日志里一个字都不留，事后完全无法区分「崩了」还是「被杀了」。

@@ -46,6 +46,8 @@ const ID_NIC: i32 = 1006;
 const ID_AUTOSTART: i32 = 1007;
 /// 「自动连接」复选框（仅当自启动启用时才可勾选）
 const ID_AUTOCONNECT: i32 = 1008;
+/// 「启动显示窗口」复选框：不勾则启动后直接驻托盘，不弹主窗口
+const ID_SHOW_WINDOW: i32 = 1009;
 
 /// 自定义消息：让工作线程把界面更新投递回 UI 线程执行
 const WM_APP_PUMP: u32 = WM_APP + 1;
@@ -55,7 +57,7 @@ const WIN_TITLE: &str = "校园网认证 · Mentorust";
 
 // ===== 紧凑布局（客户区像素） =====
 const CLIENT_W: i32 = 360; // 客户区宽
-const CLIENT_H: i32 = 186; // 客户区高：三行输入 + 一排按钮 + 一行选项 + 一行信息
+const CLIENT_H: i32 = 206; // 客户区高：三行输入 + 一排按钮 + 两行选项 + 一行信息
 const M: i32 = 14; // 左右边距
 const CW: i32 = 294; // 输入框宽度
 
@@ -98,6 +100,8 @@ static NIC_ITEMS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 static NIC_SEL: Mutex<String> = Mutex::new(String::new());
 /// 「自动连接」是否勾选（界面 / 配置文件 / 启动逻辑共用这**一份**真相，避免状态漂移）
 static AUTO_CONNECT: Mutex<bool> = Mutex::new(false);
+/// 「启动显示窗口」是否勾选（同样只存一份真相：save_config 直接读它写 ini）
+static SHOW_WINDOW: Mutex<bool> = Mutex::new(true);
 /// 本次是否由「开机自启动」拉起 —— 只有这种启动才允许自动发起连接，
 /// 手动双击 exe 时即便勾了「自动连接」也只开界面（不擅自联网）。
 static STARTUP_LAUNCH: AtomicBool = AtomicBool::new(false);
@@ -125,6 +129,11 @@ pub fn set_startup_launch(on: bool) {
 /// 当前「自动连接」勾选态
 fn auto_connect_now() -> bool {
     *AUTO_CONNECT.lock().unwrap()
+}
+
+/// 当前「启动显示窗口」勾选态
+fn show_window_now() -> bool {
+    *SHOW_WINDOW.lock().unwrap()
 }
 
 // ===== 小工具 =====
@@ -166,6 +175,8 @@ struct Cfg {
     nic: String,
     /// 勾过「自动连接」（最终是否生效还要看开机自启动是否启用）
     autoconnect: bool,
+    /// 启动时是否显示主窗口（不勾 = 直接驻托盘；缺省 true，兼容旧配置文件）
+    show_window: bool,
 }
 
 fn load_config() -> Cfg {
@@ -176,6 +187,7 @@ fn load_config() -> Cfg {
                 pass: String::new(),
                 nic: String::new(),
                 autoconnect: false,
+                show_window: true,
             };
             let mut legacy_plain = false;
             for line in txt.lines() {
@@ -192,8 +204,13 @@ fn load_config() -> Cfg {
                     c.nic = v.trim().to_string();
                 } else if let Some(v) = line.strip_prefix("autoconnect=") {
                     c.autoconnect = v.trim() == "1";
+                } else if let Some(v) = line.strip_prefix("show_window=") {
+                    c.show_window = v.trim() != "0";
                 }
             }
+            // 全局勾选态从配置恢复：save_config 直接读全局写 ini，
+            // 必须赶在下面「明文迁移重写」之前，否则迁移会把用户的选择冲掉。
+            *SHOW_WINDOW.lock().unwrap() = c.show_window;
             if legacy_plain {
                 // 明文口令已落过盘 —— 立刻换成密文，不等用户下次点「连接」
                 save_config(&c.user, &c.pass, &c.nic, c.autoconnect);
@@ -209,6 +226,7 @@ fn load_config() -> Cfg {
         pass: crate::DEFAULT_PASS.to_string(),
         nic: String::new(),
         autoconnect: false,
+        show_window: true,
     }
 }
 
@@ -219,21 +237,23 @@ fn save_config(user: &str, pass: &str, nic: &str, autoconnect: bool) {
             let _ = std::fs::write(
                 p,
                 format!(
-                    "user={}\npass_enc={}\nnic={}\nautoconnect={}\n",
+                    "user={}\npass_enc={}\nnic={}\nautoconnect={}\nshow_window={}\n",
                     user,
                     enc,
                     nic,
-                    if autoconnect { 1 } else { 0 }
+                    if autoconnect { 1 } else { 0 },
+                    if show_window_now() { 1 } else { 0 }
                 ),
             );
         } else {
             let _ = std::fs::write(
                 p,
                 format!(
-                    "user={}\nnic={}\nautoconnect={}\n",
+                    "user={}\nnic={}\nautoconnect={}\nshow_window={}\n",
                     user,
                     nic,
-                    if autoconnect { 1 } else { 0 }
+                    if autoconnect { 1 } else { 0 },
+                    if show_window_now() { 1 } else { 0 }
                 ),
             );
         }
@@ -1043,6 +1063,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let (u, p) = (get_text(hwnd, ID_USER), get_text(hwnd, ID_PASS));
                     save_config(&u, &p, &current_nic(), on);
                 }
+                ID_SHOW_WINDOW => {
+                    let on = checkbox_checked(hwnd, ID_SHOW_WINDOW);
+                    *SHOW_WINDOW.lock().unwrap() = on;
+                    say_log(if on {
+                        "已启用「启动显示窗口」：启动时打开主界面"
+                    } else {
+                        "已关闭「启动显示窗口」：下次启动直接驻托盘，不弹窗口"
+                    });
+                    let (u, p) = (get_text(hwnd, ID_USER), get_text(hwnd, ID_PASS));
+                    save_config(&u, &p, &current_nic(), auto_connect_now());
+                }
                 ID_NIC => {
                     if note == CBN_SELCHANGE {
                         on_nic_changed(hwnd);
@@ -1254,9 +1285,12 @@ pub fn run() {
             M, 130, 120, 18, hinst);
         make_child(hwnd, "BUTTON", "自动连接", ST_CHK, WINDOW_EX_STYLE(0), ID_AUTOCONNECT,
             M + 126, 130, 116, 18, hinst);
+        // 第二行选项：启动时是否显示窗口（不勾 = 直接驻托盘，保活不受影响）
+        make_child(hwnd, "BUTTON", "启动显示窗口", ST_CHK, WINDOW_EX_STYLE(0), ID_SHOW_WINDOW,
+            M, 150, 120, 18, hinst);
 
         make_child(hwnd, "EDIT", "", ST_INFO,
-            WINDOW_EX_STYLE(WS_EX_CLIENTEDGE.0), ID_INFO, M, 154, CW + 38, 22, hinst);
+            WINDOW_EX_STYLE(WS_EX_CLIENTEDGE.0), ID_INFO, M, 172, CW + 38, 22, hinst);
 
         // 填入网卡列表（默认选中上次用的那张）
         reload_nics(combo);
@@ -1265,7 +1299,14 @@ pub fn run() {
         set_text(hwnd, ID_USER, &cfg_user);
         set_text(hwnd, ID_PASS, &cfg_pass);
 
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        // 「启动显示窗口」没勾 → 启动即驻托盘，不弹主窗口。
+        // 窗口本身已创建（单实例查找 / 托盘唤出都靠它），只是不显示。
+        if show_window_now() {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        } else {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            log::info!("[GUI] 配置为启动不显示窗口，本次直接驻托盘（双击再次运行可唤出）");
+        }
         // 挂托盘图标：关窗后程序仍在此驻留（图标 + 菜单是唯一入口）
         tray_add(hwnd);
         say_status("○ 未连接");
@@ -1275,6 +1316,15 @@ pub fn run() {
         // 自启动状态以注册表为准；ini 里的 autoconnect 只是「意愿」，还要自启动开着才生效。
         let autostart = autostart_on();
         apply_options(hwnd, autostart, cfg_autoconnect);
+        // 「启动显示窗口」恢复勾选态
+        if let Ok(c) = GetDlgItem(hwnd, ID_SHOW_WINDOW) {
+            SendMessageW(
+                c,
+                BM_SETCHECK,
+                WPARAM(if show_window_now() { BST_ON } else { BST_OFF }),
+                LPARAM(0),
+            );
+        }
         if autostart {
             // exe 可能被挪过位置 → 顺手把 Run 项刷新成当前路径（否则开机拉起的是旧位置）
             set_autostart(true);
