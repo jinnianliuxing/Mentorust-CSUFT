@@ -46,7 +46,7 @@ const ID_NIC: i32 = 1006;
 const ID_AUTOSTART: i32 = 1007;
 /// 「自动连接」复选框（仅当自启动启用时才可勾选）
 const ID_AUTOCONNECT: i32 = 1008;
-/// 「启动显示窗口」复选框：不勾则启动后直接驻托盘，不弹主窗口
+/// 「自启窗口」复选框：不勾则启动后直接驻托盘，不弹主窗口
 const ID_SHOW_WINDOW: i32 = 1009;
 
 /// 自定义消息：让工作线程把界面更新投递回 UI 线程执行
@@ -57,7 +57,7 @@ const WIN_TITLE: &str = "校园网认证 · Mentorust";
 
 // ===== 紧凑布局（客户区像素） =====
 const CLIENT_W: i32 = 360; // 客户区宽
-const CLIENT_H: i32 = 206; // 客户区高：三行输入 + 一排按钮 + 两行选项 + 一行信息
+const CLIENT_H: i32 = 186; // 客户区高：三行输入 + 一排按钮 + 一行选项 + 一行信息
 const M: i32 = 14; // 左右边距
 const CW: i32 = 294; // 输入框宽度
 
@@ -100,7 +100,7 @@ static NIC_ITEMS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 static NIC_SEL: Mutex<String> = Mutex::new(String::new());
 /// 「自动连接」是否勾选（界面 / 配置文件 / 启动逻辑共用这**一份**真相，避免状态漂移）
 static AUTO_CONNECT: Mutex<bool> = Mutex::new(false);
-/// 「启动显示窗口」是否勾选（同样只存一份真相：save_config 直接读它写 ini）
+/// 「自启窗口」是否勾选（同样只存一份真相：save_config 直接读它写 ini）
 static SHOW_WINDOW: Mutex<bool> = Mutex::new(true);
 /// 本次是否由「开机自启动」拉起 —— 只有这种启动才允许自动发起连接，
 /// 手动双击 exe 时即便勾了「自动连接」也只开界面（不擅自联网）。
@@ -131,7 +131,7 @@ fn auto_connect_now() -> bool {
     *AUTO_CONNECT.lock().unwrap()
 }
 
-/// 当前「启动显示窗口」勾选态
+/// 当前「自启窗口」勾选态
 fn show_window_now() -> bool {
     *SHOW_WINDOW.lock().unwrap()
 }
@@ -1067,9 +1067,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let on = checkbox_checked(hwnd, ID_SHOW_WINDOW);
                     *SHOW_WINDOW.lock().unwrap() = on;
                     say_log(if on {
-                        "已启用「启动显示窗口」：启动时打开主界面"
+                        "已启用「自启窗口」：启动时打开主界面"
                     } else {
-                        "已关闭「启动显示窗口」：下次启动直接驻托盘，不弹窗口"
+                        "已关闭「自启窗口」：下次启动直接驻托盘，不弹窗口"
                     });
                     let (u, p) = (get_text(hwnd, ID_USER), get_text(hwnd, ID_PASS));
                     save_config(&u, &p, &current_nic(), auto_connect_now());
@@ -1276,21 +1276,22 @@ pub fn run() {
         // 下拉列表允许比控件更宽，长描述才看得全
         SendMessageW(combo, CB_SETDROPPEDWIDTH, WPARAM(430), LPARAM(0));
 
-        let bw = (CW - 16) / 2;
+        // 按钮与信息栏同宽（CW+38）左右均布：两个 158 中间隔 16，右缘与信息栏对齐
+        let bw = (CW + 38 - 16) / 2;
         make_child(hwnd, "BUTTON", "连  接", ST_BTN_DEF, WINDOW_EX_STYLE(0), ID_BTN_CONNECT, M, 98, bw, 26, hinst);
         make_child(hwnd, "BUTTON", "断  开", ST_BTN, WINDOW_EX_STYLE(0), ID_BTN_DISCONNECT, M + bw + 16, 98, bw, 26, hinst);
 
-        // ---- 一行选项：开机自启动 / 自动连接（后者只在自启动启用时可勾） ----
+        // ---- 一行选项：开机自启动 / 自动连接 / 自启窗口（三个等宽同排，右缘与信息栏对齐） ----
+        // 「自动连接」只在自启动启用时可勾；「自启窗口」不勾 = 启动直接驻托盘。
         make_child(hwnd, "BUTTON", "开机自启动", ST_CHK, WINDOW_EX_STYLE(0), ID_AUTOSTART,
-            M, 130, 120, 18, hinst);
+            M, 130, 100, 18, hinst);
         make_child(hwnd, "BUTTON", "自动连接", ST_CHK, WINDOW_EX_STYLE(0), ID_AUTOCONNECT,
-            M + 126, 130, 116, 18, hinst);
-        // 第二行选项：启动时是否显示窗口（不勾 = 直接驻托盘，保活不受影响）
-        make_child(hwnd, "BUTTON", "启动显示窗口", ST_CHK, WINDOW_EX_STYLE(0), ID_SHOW_WINDOW,
-            M, 150, 120, 18, hinst);
+            M + 116, 130, 100, 18, hinst);
+        make_child(hwnd, "BUTTON", "自启窗口", ST_CHK, WINDOW_EX_STYLE(0), ID_SHOW_WINDOW,
+            M + 232, 130, 100, 18, hinst);
 
         make_child(hwnd, "EDIT", "", ST_INFO,
-            WINDOW_EX_STYLE(WS_EX_CLIENTEDGE.0), ID_INFO, M, 172, CW + 38, 22, hinst);
+            WINDOW_EX_STYLE(WS_EX_CLIENTEDGE.0), ID_INFO, M, 156, CW + 38, 22, hinst);
 
         // 填入网卡列表（默认选中上次用的那张）
         reload_nics(combo);
@@ -1299,7 +1300,7 @@ pub fn run() {
         set_text(hwnd, ID_USER, &cfg_user);
         set_text(hwnd, ID_PASS, &cfg_pass);
 
-        // 「启动显示窗口」没勾 → 启动即驻托盘，不弹主窗口。
+        // 「自启窗口」没勾 → 启动即驻托盘，不弹主窗口。
         // 窗口本身已创建（单实例查找 / 托盘唤出都靠它），只是不显示。
         if show_window_now() {
             let _ = ShowWindow(hwnd, SW_SHOW);
@@ -1316,7 +1317,7 @@ pub fn run() {
         // 自启动状态以注册表为准；ini 里的 autoconnect 只是「意愿」，还要自启动开着才生效。
         let autostart = autostart_on();
         apply_options(hwnd, autostart, cfg_autoconnect);
-        // 「启动显示窗口」恢复勾选态
+        // 「自启窗口」恢复勾选态
         if let Ok(c) = GetDlgItem(hwnd, ID_SHOW_WINDOW) {
             SendMessageW(
                 c,
