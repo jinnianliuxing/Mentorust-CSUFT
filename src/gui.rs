@@ -469,24 +469,78 @@ fn short_desc(d: &str) -> String {
     }
 }
 
+/// 虚拟 / 伪网卡描述里必然出现的关键词。
+///
+/// 依据本机实测（2026-10-21，`examples/nic_dump.rs` 的输出）：
+///   WAN Miniport (Network Monitor / IPv6 / IP)   -> 无二层，不是网卡
+///   Hyper-V Virtual Ethernet Adapter              -> 虚拟
+///   VMware Virtual Ethernet Adapter for VMnetN    -> 虚拟
+///   Microsoft Wi-Fi Direct Virtual Adapter #N     -> 虚拟（移动热点）
+///   Adapter for loopback traffic capture          -> 回环伪设备
+const VIRTUAL_NIC_HINTS: [&str; 12] = [
+    "Virtual", "Miniport", "loopback", "Loopback", "Tunnel", "TAP", "Tap",
+    "Bluetooth", "Npcap", "NPCAP", "Filter", "Hyper-V",
+];
+
+/// 这块卡是不是「虚拟 / 伪网卡」—— 是就不该出现在选择列表里。
+fn is_virtual_nic(desc: &str) -> bool {
+    VIRTUAL_NIC_HINTS.iter().any(|h| desc.contains(h))
+}
+
+/// 是不是无线网卡（无线也可能是校园网认证的目标，保留但排在后面）。
+fn is_wireless_nic(desc: &str) -> bool {
+    let d = desc.to_ascii_lowercase();
+    d.contains("wi-fi") || d.contains("wifi") || d.contains("wireless")
+        || d.contains("wlan") || d.contains("802.11")
+}
+
+/// 地址本身就不该出现的：回环、APIPA（169.254 = 没拿到 DHCP 租约）、未分配。
+fn addr_unusable(ip: &std::net::Ipv4Addr) -> bool {
+    ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()
+        || ip.octets()[0] == 169 && ip.octets()[1] == 254
+}
+
 /// 扫描本机网卡（走 Npcap，名称与 `-n` / `--gui-nic` 参数完全一致）。
-/// 返回 (NPF 名称, 显示标签)；带 10.x 地址的（校园网网段）排在前面。
+/// 返回 (NPF 名称, 显示标签)。
+///
+/// **只列出真正能用来认证的网卡**：虚拟网卡 / WAN 微型端口 / 回环伪设备
+/// 一律剔除；有 10.x 地址的排在最前。
+///
+/// 排序：
+///   0 有线 + 10.x   <- 校园网有线口（常态）
+///   1 有线 + 其它 IPv4
+///   2 有线 + 无地址
+///   3 无线 + 10.x
+///   4 无线 + 其它 IPv4
+///   5 无线 + 无地址
+///
+/// 无线排在有线之后是有原因的：校园 Wi-Fi 也发 10.x，若无线排前面，
+/// 在线探测会拿无线地址去应答，把有线的掉线完全掩盖（见 campus_online 注释）。
 fn scan_nics() -> Vec<(String, String)> {
     let mut rows: Vec<(u8, String, String)> = Vec::new();
     match pcap::Device::list() {
         Ok(devs) => {
             for d in devs {
+                let base = d.desc.clone().unwrap_or_else(|| d.name.clone());
+                if is_virtual_nic(&base) {
+                    continue;
+                }
                 let v4 = d.addresses.iter().find_map(|a| match a.addr {
                     std::net::IpAddr::V4(v) => Some(v),
                     _ => None,
                 });
-                let base = d.desc.clone().unwrap_or_else(|| d.name.clone());
-                let (rank, label) = match v4 {
+                // 地址不可用（回环 / APIPA / 未分配）时不当成有效地址
+                let usable = v4.filter(|ip| !addr_unusable(ip));
+                let wireless = is_wireless_nic(&base);
+                let base_rank = if wireless { 3u8 } else { 0u8 };
+                let (rank, label) = match usable {
                     Some(ip) if ip.octets()[0] == 10 => {
-                        (0u8, format!("{} · {}", short_desc(&base), ip))
+                        (base_rank, format!("{} · {}", short_desc(&base), ip))
                     }
-                    Some(ip) => (1u8, format!("{} · {}", short_desc(&base), ip)),
-                    None => (2u8, format!("{} · 无地址", short_desc(&base))),
+                    Some(ip) => {
+                        (base_rank + 1, format!("{} · {}", short_desc(&base), ip))
+                    }
+                    None => (base_rank + 2, format!("{} · 无地址", short_desc(&base))),
                 };
                 rows.push((rank, d.name.clone(), label));
             }
@@ -550,8 +604,10 @@ unsafe fn on_nic_changed(parent: HWND) {
 // ===== 业务动作（跑在工作线程） =====
 
 fn do_connect(user: &str, pass: &str, nic: &str) -> String {
-    // 这是用户**显式**点「连接」→ 清除「手动断开」标记，恢复自动重连能力。
-    crate::set_stop_flag(false);
+    // 注意：**这里不清除「手动断开」标记**。
+    // 清除动作只在用户显式点「连接」时发生（见 start_connect 的
+    // user_initiated 分支）。放在这里会让 GUI 启动时的自动连接
+    // 也把闩锁清掉 → 「刚手动断开又自己连回来」。
 
     // 只认「认证网卡自己」的地址：否则同时连着校园 Wi-Fi 时会被误判成
     // 已在线，点「连接」不生效 —— 表现为"必须先点一次「断开」才能「连接」"。
@@ -569,6 +625,13 @@ fn do_connect(user: &str, pass: &str, nic: &str) -> String {
             break;
         }
         thread::sleep(Duration::from_millis(600));
+    }
+
+    // 手动断开闩锁：只有用户显式点「连接」才能清除并继续。
+    // 这里之所以还要查一次，是防「自动连接」路径绕过 GUI 启动时的检查。
+    if crate::manual_disconnect_latched() {
+        crate::set_stop_flag(false);
+        say_log("已解除「手动断开」状态，开始连接...");
     }
 
     if already_online {
@@ -634,9 +697,25 @@ fn do_disconnect(nic: &str) -> String {
     "已发注销包，处于手动断开状态（不自动重连）".to_string()
 }
 
-fn start_connect(parent: HWND) {
+/// `user_initiated` = 用户主动点「连接」。
+///
+/// true  → 解除「手动断开」状态，允许连接。
+/// false → 开机自启的自动连接；此时若用户之前手动断开过，**必须拒绝连接**。
+fn start_connect(parent: HWND, user_initiated: bool) {
     if BUSY.swap(true, Ordering::SeqCst) {
         return;
+    }
+    if !user_initiated && crate::manual_disconnect_latched() {
+        // 用户主动断开过 → 任何自动路径都不许把它连回来。
+        unsafe { set_busy(parent, false) };
+        BUSY.store(false, Ordering::SeqCst);
+        say_status("○ 已断开（手动）");
+        say_log("处于「手动断开」状态，跳过自动连接。需要联网请点「连接」。");
+        return;
+    }
+    if user_initiated {
+        // 唯一的解除点：用户显式点「连接」。
+        crate::set_stop_flag(false);
     }
     let (user, pass) = unsafe { (get_text(parent, ID_USER), get_text(parent, ID_PASS)) };
     let nic = current_nic();
@@ -935,7 +1014,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let id = (wparam.0 & 0xFFFF) as i32;
             let note = ((wparam.0 >> 16) & 0xFFFF) as u32;
             match id {
-                ID_BTN_CONNECT => start_connect(hwnd),
+                ID_BTN_CONNECT => start_connect(hwnd, true),
                 ID_BTN_DISCONNECT => start_disconnect(hwnd),
                 ID_AUTOSTART => {
                     let on = checkbox_checked(hwnd, ID_AUTOSTART);
@@ -978,7 +1057,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 IDM_SHOW => show_main(hwnd),
                 IDM_CONNECT => {
                     show_main(hwnd); // 先亮出界面，让用户看到"连接中..."
-                    start_connect(hwnd);
+                    start_connect(hwnd, true);
                 }
                 IDM_DISCONNECT => start_disconnect(hwnd),
                 IDM_EXIT => tray_exit(hwnd),
@@ -1200,16 +1279,41 @@ pub fn run() {
             // exe 可能被挪过位置 → 顺手把 Run 项刷新成当前路径（否则开机拉起的是旧位置）
             set_autostart(true);
         }
-        if STARTUP_LAUNCH.load(Ordering::SeqCst) && autostart && cfg_autoconnect {
+        // 「手动断开」闩锁优先：用户主动断开后，任何自动路径都不许再连回来。
+        // （这一处以前漏了检查 → logoff 之后 GUI 会自己把 ghost 拉起来，
+        //   表现为"刚断开又自动连上"。）
+        if crate::manual_disconnect_latched() {
+            say_log("处于「手动断开」状态，不自动连接。需要联网请点「连接」。");
+            say_status("○ 已断开（手动）");
+            // 也写进日志文件：长期测试分析时需要知道"为什么没连"，
+            // 界面上的一句话在日志里是没有的。
+            log::info!(
+                "[LATCH] 手动断开闩锁生效，跳过自动连接 (startup={} autostart={} autoconnect={})",
+                STARTUP_LAUNCH.load(Ordering::SeqCst),
+                autostart,
+                cfg_autoconnect
+            );
+        } else if STARTUP_LAUNCH.load(Ordering::SeqCst) && autostart && cfg_autoconnect {
             say_log("开机自启动：正在自动连接...");
-            start_connect(hwnd);
+            start_connect(hwnd, false);
         }
 
         // 启动时立刻探测一次当前状态（只刷状态，不覆盖上面那句提示）
         thread::spawn(|| {
             let online = crate::campus_online(&current_nic());
             ONLINE.store(online, Ordering::SeqCst);
-            say_status(if online { "● 已连接" } else { "○ 未连接" });
+            // 手动断开闩锁生效时，状态必须显示「已断开（手动）」，
+            // 不能被这里覆盖成「未连接」—— 否则用户看到界面变回"未连接"，
+            // 会以为程序根本没记住自己刚点过断开。
+            if crate::manual_disconnect_latched() {
+                say_status(if online {
+                    "○ 已断开（手动）· 仍有网络"
+                } else {
+                    "○ 已断开（手动）"
+                });
+            } else {
+                say_status(if online { "● 已连接" } else { "○ 未连接" });
+            }
         });
 
         // 之后每 3 秒刷新一次状态栏：掉线和后台自动重连都能实时看到。

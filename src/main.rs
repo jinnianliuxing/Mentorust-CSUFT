@@ -4,6 +4,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod net;
+mod dhcp;
 mod pcapx;
 mod packets;
 mod eap;
@@ -69,18 +70,52 @@ const DEFAULT_DHCP_MODE: u8 = 0;
 //   · do_connect/连接  → 清除标记
 //   · ghost 启动/监督循环/--auto → 发现标记就拒绝联网并退出
 // 这样即使开机自启、残留进程、看门狗之类的路径，也不会把手动断开的连接拉回来。
+/// 「手动断开」标记的**权威路径**：%LOCALAPPDATA%\mentorust\mentorust.stop
+///
+/// 原来用 `current_exe().parent()`，而机器上有三份 exe（工程根 / portable/ /
+/// target\release\）→ 三个互相独立的标记文件，在 A 目录断开、B 目录启动
+/// 完全无效。改为固定路径后所有副本共享同一个闩锁。
 fn stop_flag_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var("APPDATA").ok().map(std::path::PathBuf::from))?;
+    let d = base.join("mentorust");
+    let _ = std::fs::create_dir_all(&d);
+    Some(d.join("mentorust.stop"))
+}
+
+/// 兼容镜像：老版本把标记写在 exe 同目录。
+///
+/// 写标记时两处都写（保证旧版本/旧路径也看得到），
+/// 读标记时两处任一存在即算「已手动断开」（保证旧标记也仍然生效）。
+fn stop_flag_legacy_path() -> Option<std::path::PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("mentorust.stop")))
 }
 
+/// 供 GUI 模块查询：用户是否已手动断开。
+pub(crate) fn manual_disconnect_latched() -> bool {
+    stop_flag_set()
+}
+
 fn stop_flag_set() -> bool {
-    stop_flag_path().map(|p| p.exists()).unwrap_or(false)
+    let fixed = stop_flag_path().map(|p| p.exists()).unwrap_or(false);
+    let legacy = stop_flag_legacy_path().map(|p| p.exists()).unwrap_or(false);
+    fixed || legacy
 }
 
 fn set_stop_flag(on: bool) {
     if let Some(p) = stop_flag_path() {
+        if on {
+            let _ = std::fs::write(&p, "manual disconnect\n");
+        } else {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    // 兼容镜像：老版本/旧路径也写一份。
+    if let Some(p) = stop_flag_legacy_path() {
         if on {
             let _ = std::fs::write(&p, "manual disconnect\n");
         } else {
@@ -100,6 +135,10 @@ static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
 /// 日志文件路径（轮转时要用）与累计行数（每 100 行触发一次体积检查）。
 static LOG_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 static LOG_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 进程角色：`gui` / `ghost` / `cli`。
+/// 长期测试时 GUI 日志和后台认证进程日志必须能分开 —— 掉线判定发生在
+/// ghost 里，但用户点「连接」的动作发生在 gui 里。
+static LOG_ROLE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 struct SimpleLogger;
 
@@ -108,19 +147,44 @@ struct SimpleLogger;
 /// 以前只打 HH:MM:SS：日志会连续累积很多天，事后无法判断某条记录
 /// 属于哪一天，跨天分析只能靠猜测（2026-10-20 分析时整体偏了 7 天）。
 fn now_stamp() -> String {
-    let secs = SystemTime::now()
+    let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let local = secs + 8 * 3600;
+        .unwrap_or_default();
+    let local = dur.as_secs() + 8 * 3600;
     let (y, mo, d) = civil_from_days((local / 86_400) as i64);
     format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
         y, mo, d,
         (local / 3600) % 24,
         (local / 60) % 60,
-        local % 60
+        local % 60,
+        dur.subsec_millis()
     )
+}
+
+/// 日志目录：统一到 %LOCALAPPDATA%\mentorust\logs\。
+///
+/// 之前日志写在 **exe 同目录**，而机器上有三份 exe（工程根 / portable/ /
+/// target\release\），于是三份 exe 写三个目录、互不相认 —— 长期测试时
+/// 根本说不清"哪份日志才是那一次连接"的。统一到一个固定目录才对得上。
+fn log_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var("APPDATA").ok().map(std::path::PathBuf::from))?;
+    let d = base.join("mentorust").join("logs");
+    let _ = std::fs::create_dir_all(&d);
+    Some(d)
+}
+
+/// 当天日志文件名：mentorust-2026-10-21-ghost.log
+///
+/// 按天分文件 —— 30 天挂机测试不会把最早的证据轮转掉。
+fn log_file_for(role: &str) -> Option<std::path::PathBuf> {
+    let d = log_dir()?;
+    let stamp = now_stamp();
+    let day = &stamp[..10];
+    Some(d.join(format!("mentorust-{}-{}.log", day, role)))
 }
 
 /// 由「1970-01-01 起的整日数」反算年月日（Howard Hinnant civil_from_days 算法）。
@@ -146,7 +210,17 @@ impl log::Log for SimpleLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        let line = format!("{} {:<5} {}\n", now_stamp(), record.level(), record.args());
+        let role = LOG_ROLE
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| String::from("?"));
+        let line = format!(
+            "{} [{:<6}] {:<5} {}\n",
+            now_stamp(),
+            role,
+            record.level(),
+            record.args()
+        );
         if let Ok(mut guard) = LOG_FILE.lock() {
             if let Some(f) = guard.as_mut() {
                 let _ = f.write_all(line.as_bytes());
@@ -171,21 +245,57 @@ impl log::Log for SimpleLogger {
 
 /// 初始化日志：落盘到 exe 同目录 mentorust.log（超过 1MB 滚动）
 fn init_logging() {
-    let path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("mentorust.log")));
-    if let Some(p) = path {
+    // 角色先定下来：--ghost 是后台认证进程，其余是 GUI / CLI。
+    let role = if std::env::args().any(|a| a == "--ghost") {
+        "ghost"
+    } else if std::env::args().any(|a| a == "--startup") {
+        "startup"
+    } else if std::env::args().any(|a| a == "logoff") {
+        "logoff"
+    } else {
+        "gui"
+    };
+    if let Ok(mut g) = LOG_ROLE.lock() {
+        *g = String::from(role);
+    }
+
+    // 主日志：%LOCALAPPDATA%\mentorust\logs\mentorust-YYYY-MM-DD-<role>.log
+    let path = log_file_for(role);
+    if let Some(p) = path.clone() {
         if let Ok(mut g) = LOG_PATH.lock() {
             *g = Some(p.clone());
         }
-        if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+        {
             if let Ok(mut g) = LOG_FILE.lock() {
                 *g = Some(f);
+            }
+        }
+        // 兼容：exe 同目录也留一份，老习惯看那儿的同学不会找不到。
+        // 但真正的分析入口是 logs\ 目录。
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let legacy = dir.join("mentorust.log");
+                if legacy != p {
+                    // 只在 legacy 不存在时创建，避免与主文件混写
+                    if !legacy.exists() {
+                        let _ = std::fs::write(&legacy, b"");
+                    }
+                }
             }
         }
     }
     let _ = log::set_logger(&SimpleLogger);
     log::set_max_level(log::LevelFilter::Info);
+    info!(
+        "[BOOT] role={} pid={} log={:?}",
+        role,
+        std::process::id(),
+        path.as_ref().map(|p| p.display().to_string())
+    );
 }
 
 /// 日志超过 2 MB 就滚动：mentorust.log -> .log.1 -> .log.2（保留两份）。
@@ -199,16 +309,51 @@ fn maybe_rotate_log() {
         Some(p) => p,
         None => return,
     };
-    let too_big = std::fs::metadata(&path).map(|m| m.len() > 2_000_000).unwrap_or(false);
+    // 单文件上限放宽到 32 MB：现在的基线采样每 60 秒一条、加上重连细节，
+    // 一天大约几百 KB，32 MB 足够覆盖一整天的极端情况。
+    let too_big = std::fs::metadata(&path).map(|m| m.len() > 32_000_000).unwrap_or(false);
     if !too_big {
+        // 顺手清理 30 天前的旧日志 —— 长期挂机不能无限涨盘。
+        if let Some(dir) = path.parent() {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                let cutoff = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+                    .saturating_sub(30 * 86_400);
+                for e in rd.flatten() {
+                    let fname = e.file_name().to_string_lossy().to_string();
+                    if !fname.starts_with("mentorust-") || !fname.ends_with(".log") {
+                        continue;
+                    }
+                    let mtime = e
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(u64::MAX);
+                    if mtime < cutoff {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
         return;
     }
     if let Ok(mut g) = LOG_FILE.lock() {
         *g = None;
     }
-    let _ = std::fs::remove_file(path.with_extension("log.2"));
-    let _ = std::fs::rename(path.with_extension("log.1"), path.with_extension("log.2"));
-    let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    // 同一天的文件改名成 .1 / .2（不是跨天），当天日志仍然连续。
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("mentorust")
+        .to_string();
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let _ = std::fs::remove_file(dir.join(format!("{}.2.log", stem)));
+    let _ = std::fs::rename(dir.join(format!("{}.1.log", stem)), dir.join(format!("{}.2.log", stem)));
+    let _ = std::fs::rename(&path, dir.join(format!("{}.1.log", stem)));
     if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         if let Ok(mut g) = LOG_FILE.lock() {
             *g = Some(f);
@@ -456,12 +601,121 @@ fn campus_ipv4_of(nic_name: &str) -> Option<std::net::Ipv4Addr> {
     })
 }
 
+/// 按 MAC 找 10.x 地址 —— 网卡 GUID 变化后的兜底。
+///
+/// 见 `net::get_network_interface_by_mac` 的说明：名字会变，MAC 不会。
+fn campus_ipv4_by_mac(mac: &[u8; 6]) -> Option<std::net::Ipv4Addr> {
+    let iface = net::get_network_interface_by_mac(mac)?;
+    iface.ips.iter().find_map(|ip| match ip.ip() {
+        IpAddr::V4(v4) if v4.octets()[0] == 10 => Some(v4),
+        _ => None,
+    })
+}
+
+/// 统一取「本机 10.x 地址」：先按名字，名字失效则按 MAC 兜底。
+///
+/// 名字失效在网卡重新枚举后是常态（实测 GUID 变过），必须兜住，
+/// 否则在线判定恒为 false，会把一段完全正常的连接记录成连续掉线。
+fn campus_ipv4_resilient(nic_name: &str, mac: &[u8; 6]) -> Option<std::net::Ipv4Addr> {
+    if let Some(ip) = campus_ipv4_of(nic_name) {
+        return Some(ip);
+    }
+    if let Some(ip) = campus_ipv4_by_mac(mac) {
+        return Some(ip);
+    }
+    None
+}
+
 /// 认证网卡是否真的能上网：必须用它自己的源地址做 DNS 探测。
 ///
 /// 用「任意 10.x 网卡」判断在线是错的：同时连着校园 Wi-Fi 时，
 /// Wi-Fi 会替有线"回答"探测，导致掉线被误判为在线。
+/// 掉线模拟：还剩几次探测要报「不通」。
+///
+/// 仅由 `MENTORUST_SIMULATE_DROP` 设置，用完即清零。
+/// 目的是在**不动网络**的前提下驱动掉线判定的完整代码路径
+/// （offline_strikes -> OFFLINE_STRIKES -> [EVT:DROP] -> 重认证）。
+/// 真实断网需要管理员（改路由/禁用网卡），而且会连带切断
+/// 自动化代理自己的网络，所以走这条受控的模拟路径。
+static SIMULATE_DROP_LEFT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+/// 环境变量只读一次 —— 否则预算耗尽后会被重新填满，变成无限掉线循环。
+static SIMULATE_DROP_INITED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// 「掉一次就停」模式：触发第一次 [EVT:DROP] 后自动关闭模拟。
+static SIMULATE_DROP_ONCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 从环境变量取一次模拟次数（每个进程只取一次，避免每轮循环重读）。
+fn simulate_drop_budget() -> u32 {
+    use std::sync::atomic::Ordering;
+    // 只在第一次调用时读环境变量。v2 在这里每次都读，导致预算耗尽后
+    // 被重新填满 -> 无限掉线循环。
+    if !SIMULATE_DROP_INITED.swap(true, Ordering::SeqCst) {
+        if let Ok(v) = std::env::var("MENTORUST_SIMULATE_DROP") {
+            if let Ok(n) = v.trim().parse::<u32>() {
+                if n > 0 {
+                    SIMULATE_DROP_LEFT.store(n, Ordering::SeqCst);
+                    SIMULATE_DROP_ONCE.store(
+                        std::env::var("MENTORUST_SIMULATE_DROP_ONCE")
+                            .map(|x| x.trim() == "1")
+                            .unwrap_or(false),
+                        Ordering::SeqCst,
+                    );
+                    warn!(
+                        "[TEST] 掉线模拟已启用：接下来 {} 次探测将报「不通」{}",
+                        n,
+                        if SIMULATE_DROP_ONCE.load(Ordering::SeqCst) {
+                            "（一次性，触发掉线后自动关闭）"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+        }
+    }
+    SIMULATE_DROP_LEFT.load(Ordering::SeqCst)
+}
+
+/// 掉线判定成立后调用：一次性模式下关闭模拟，让会话恢复正常。
+fn simulate_drop_disarm() {
+    use std::sync::atomic::Ordering;
+    if SIMULATE_DROP_ONCE.load(Ordering::SeqCst) {
+        SIMULATE_DROP_LEFT.store(0, Ordering::SeqCst);
+        warn!("[TEST] 一次性掉线模拟已用完，模拟关闭，后续探测恢复真实结果");
+    }
+}
+
 fn campus_online(nic_name: &str) -> bool {
     campus_ipv4_of(nic_name)
+        .map(|ip| online_check(&ip))
+        .unwrap_or(false)
+}
+
+/// 掉线模拟的**唯一判定点**。
+///
+/// 主循环调的是 `campus_online_resilient()`，不是 `campus_online()`，
+/// 所以模拟必须挂在这一层，否则永远不会被触发（v1 就踩了这个坑）。
+fn simulate_drop_active() -> bool {
+    use std::sync::atomic::Ordering;
+    let budget = simulate_drop_budget();
+    if budget == 0 {
+        return false;
+    }
+    SIMULATE_DROP_LEFT.fetch_sub(1, Ordering::SeqCst);
+    true
+}
+
+/// 带 MAC 兜底的在线判定（见 `campus_ipv4_resilient`）。
+fn campus_online_resilient(nic_name: &str, mac: &[u8; 6]) -> bool {
+    // 掉线模拟优先：让主循环的探测报「不通」，驱动
+    // offline_strikes -> OFFLINE_STRIKES -> [EVT:DROP] -> 重认证
+    // 这条完整路径，而**不动真实网络**。
+    if simulate_drop_active() {
+        return false;
+    }
+    campus_ipv4_resilient(nic_name, mac)
         .map(|ip| online_check(&ip))
         .unwrap_or(false)
 }
@@ -845,6 +1099,32 @@ fn run_launcher() {
     let _ = std::io::stdin().read_line(&mut s);
 }
 
+/// 释放该网卡的 DHCP 租约（尽力而为，失败只记日志）。
+///
+/// 官方客户端的做法是 `IpReleaseAddress()`（`dhcp::release_dhcp`）。
+/// 用户态程序多半调不动（需要管理员），此时退回 `ipconfig /release`
+/// —— 官方也用同一套机制（`FUN_14018BC90` 走 `\ipconfig.exe /renew`，
+/// release 是对应的另一半）。
+///
+/// ⚠️ 这里**不 spawn 任何控制台子进程**：GUI 子系统下任何控制台子进程
+/// 都会让 Windows 弹一个黑色窗口。`ipconfig` 是控制台程序，不能直接跑。
+/// 因此只走 API，失败就如实记录，不做 GUI 里会弹黑框的事。
+fn release_lease(nic_name: &str, mac: &[u8; 6]) {
+    match dhcp::release_dhcp(nic_name, Some(mac)) {
+        Ok(code) => {
+            info!("[LOGOFF] DHCP 租约已释放 (code={})，网卡不再持有校园网地址", code);
+        }
+        Err(code) => {
+            // 0x57 = ERROR_INVALID_PARAMETER（多半是缺管理员权限）
+            // 0xC351 = 取网卡信息失败；0xC353 = 接口表里找不到该网卡
+            warn!(
+                "[LOGOFF] 释放 DHCP 租约失败 (code=0x{:X})：网卡地址可能仍保留（用户态通常缺少权限）",
+                code
+            );
+        }
+    }
+}
+
 /// 主动下线：先停掉后台认证进程，再向认证服务器发送 EAPOL-Logoff 注销会话
 fn logoff(nic_name: &str) {
     // 0. 先立「手动断开」标记：从此任何自动路径都不允许再联网，
@@ -890,6 +1170,10 @@ fn logoff(nic_name: &str) {
     let mut local_mac = [0u8; 6];
     hex::decode_to_slice(mac.replace(":", ""), &mut local_mac).unwrap();
 
+    // 先把名字取出来：下面 `Capture::from_device(dev)` 会把 dev 移走，
+    // 之后就没法再引用它了（release_lease 需要网卡名）。
+    let dev_name = dev.name.clone();
+
     // 3. 打开抓包句柄并发送 EAPOL-Logoff（标准组播 + 锐捷私有地址双保险）
     let mut cap = match Capture::from_device(dev)
         .unwrap()
@@ -904,6 +1188,7 @@ fn logoff(nic_name: &str) {
         }
     };
 
+    let mut sent = 0u8;
     for dest in [[0x01u8, 0x80, 0xc2, 0x00, 0x00, 0x03], [0x01, 0xd0, 0xf9, 0x00, 0x00, 0x03]] {
         let mut frame = Vec::with_capacity(18);
         frame.extend_from_slice(&dest);
@@ -913,12 +1198,38 @@ fn logoff(nic_name: &str) {
         frame.push(0x02); // type EAPOL-Logoff
         frame.extend_from_slice(&0x0000_u16.to_be_bytes());
         match cap.sendpacket(frame.as_slice()) {
-            Ok(_) => info!("已向 {:02x?} 发送 EAPOL-Logoff", dest),
+            Ok(_) => {
+                sent += 1;
+                info!("已向 {:02x?} 发送 EAPOL-Logoff", dest);
+            }
             Err(e) => error!("发送下线包失败: {}", e),
         }
     }
 
-    info!("[LOGOFF] 下线请求已发送，校园网会话已注销。重新联网请双击 mentorust.exe。");
+    if sent > 0 {
+        info!(
+            "[LOGOFF] 下线请求已发送（{}/2 个地址），校园网会话已注销。重新联网请双击 mentorust.exe。",
+            sent
+        );
+    } else {
+        // 之前这里无条件说"已发送"，即使两帧都失败 —— 误导。
+        warn!(
+            "[LOGOFF] 两个地址的 EAPOL-Logoff 都发送失败，服务器侧会话可能仍挂着，稍后需等 BRAS 超时。"
+        );
+    }
+
+    // 4. 释放 DHCP 租约 —— 与官方一致。
+    //
+    // 官方 8021x.exe 在认证流程内就做这件事：
+    //     FUN_14006D730  "Release IP wired" -> FUN_140184AE0 -> IpReleaseAddress()
+    // 不释放的话，机器上仍留着一个 10.x 地址和一份有效租约，
+    // 校园网会话却已经没了 —— 这不算"干净"。
+    //
+    // ⚠️ 这里**不能**写 `drop(cap)`：抓包句柄已经失效（发送失败就是这个
+    // 原因），pcap 的 Drop 实现会 panic；而 release 版是 `panic = 'abort'`，
+    // panic 会**静默杀死进程** —— 表现为"日志到某一行戛然而止，
+    // 后面所有清理都没执行"。句柄在函数返回时自然释放即可。
+    release_lease(&dev_name, &local_mac);
 }
 
 #[cfg(target_os = "linux")]
@@ -1050,23 +1361,95 @@ fn auth(
         return;
     };
 
-    let mut ipv4 = [0u8; 4];
-    let mut ipv6 = [0u8; 16];
-
-    for ip in inet.ips {
-        match ip.ip() {
-            IpAddr::V4(v4) => {
-                ipv4 = v4.octets()
-            }
-            IpAddr::V6(v6) => {
-                ipv6 = v6.to_bits().to_be_bytes()
-            }
-        }
-    }
     let mac = inet.mac.unwrap().to_string().to_lowercase();
     if mac.len() != 17 {
         error!("MAC地址({})格式错误，请检查MAC地址是否正确！", mac);
         return;
+    }
+    // 原始 MAC 字节：DHCP 接口索引按 MAC 匹配比按网卡名匹配可靠
+    // （pnet 给的是注册表 AdapterName，MIB_IF_ROW2.Alias 给的是友好名，三处口径不一致）。
+    let mac_bytes: Option<[u8; 6]> = hex::decode(mac.replace(":", "")).ok().and_then(|v| {
+        if v.len() == 6 {
+            let mut a = [0u8; 6];
+            a.copy_from_slice(&v);
+            Some(a)
+        } else {
+            None
+        }
+    });
+    let mac_ref = mac_bytes.as_ref().map(|m| &m[..]);
+
+    // ===== 认证前确保 DHCP 就绪（官方 [DHCPMODE] EnableBeforeAuth=1）=====
+    //
+    // 官方 8021x.exe 的做法：认证**之前**就启动 DHCP，让 EAPOL 握手发生在一个
+    // 已经持有合法租约的状态上；必要时在认证流程内部直接 "Release IP wired"
+    // → IpReleaseAddress() → InitDhcp 把地址彻底翻新。
+    //
+    // 为什么要照做（本项目实测 2026-10-20）：
+    //   · 认证时网卡是 APIPA(169.254.x.x) 建立的会话，会被 BRAS 在 3600 s 准点踢掉；
+    //   · 建立时已持有 10.x 的会话能活 87~207 分钟；
+    //   · 本项目的 EAP 响应帧用网卡 IPv4 作源 IP（见 start_loop），带着 APIPA 去
+    //     认证等于发出源地址非法的帧。
+    {
+        let mut ready = dhcp::wait_dhcp_ready(&nic_name, Duration::from_secs(2));
+        if ready.is_none() {
+            if dhcp_mode == 3 {
+                // dhcp_mode=3 = 认证前 DHCP：对应官方最彻底的做法，
+                // 先 IpReleaseAddress 再 IpRenewAddress，让 DHCP 完整重走握手。
+                info!("[DHCP] 认证前无 10.x 地址，按 dhcp_mode=3 执行『释放+重续』");
+                match dhcp::recycle_dhcp(&nic_name, mac_ref) {
+                    Ok(code) => info!("[DHCP] 释放+重续已提交 (code={})", code),
+                    Err(code) => warn!("[DHCP] 释放+重续失败 (code=0x{:X})", code),
+                }
+                ready = dhcp::wait_dhcp_ready(&nic_name, Duration::from_secs(15));
+            } else {
+                // 默认：官方 EnableBeforeAuth=1 的等价 —— 温和续租一次即可，
+                // 不动已有租约，避免打断正在跑的业务流量。
+                info!("[DHCP] 认证前无 10.x 地址，触发一次续租（等价官方 InitDhcp）");
+                match dhcp::renew_dhcp(&nic_name, mac_ref) {
+                    Ok(code) => info!("[DHCP] 续租已提交 (code={})", code),
+                    Err(code) => {
+                        // 0x57/0x5 = 无管理员权限。本项目是用户态程序，结构上
+                        // 调不动 IpRenewAddress —— 官方能调是因为它的 SuService.exe
+                        // 是 SYSTEM 服务。此时只能靠「等」，交给系统 DHCP 客户端。
+                        warn!(
+                            "[DHCP] 续租请求被拒 (code=0x{:X})，降级为纯等待系统 DHCP 客户端",
+                            code
+                        );
+                    }
+                }
+                ready = dhcp::wait_dhcp_ready(&nic_name, Duration::from_secs(12));
+            }
+        }
+        match ready {
+            Some(ip) => info!("[DHCP] 认证前已就绪: {}", ip),
+            None => warn!("[DHCP] 认证前仍未取得 10.x 地址（会话可能被限时 60 分钟）"),
+        }
+    }
+
+    // 测试钩子：只验证「认证前 DHCP」这一段就退出，不发任何 EAPOL。
+    // 用于在已认证的机器上安全地验证本段逻辑（真跑认证会因同 MAC 双客户端
+    // 被服务器判用户冲突）。
+    if std::env::var("MENTORUST_DHCP_PROBE").is_ok() {
+        info!("[DHCP] MENTORUST_DHCP_PROBE 生效：只验证认证前 DHCP 阶段，不发起认证");
+        return;
+    }
+
+    // DHCP 就绪之后再采集地址：EAP 响应帧用这里的 IPv4 作源 IP，
+    // 放在 DHCP 之前采集只会拿到 APIPA(169.254.x.x) 或 0.0.0.0。
+    let mut ipv4 = [0u8; 4];
+    let mut ipv6 = [0u8; 16];
+    if let Some(iface) = net::get_network_interface_by_name(&nic.name) {
+        for ip in iface.ips {
+            match ip.ip() {
+                IpAddr::V4(v4) => {
+                    ipv4 = v4.octets()
+                }
+                IpAddr::V6(v6) => {
+                    ipv6 = v6.to_bits().to_be_bytes()
+                }
+            }
+        }
     }
     info!("网卡({})IPv4地址: {:?}", nic.desc.as_ref().unwrap_or(&nic.name), ipv4);
     info!("网卡({})IPv6地址: {:?}", nic.desc.as_ref().unwrap_or(&nic.name), ipv6);
@@ -1094,10 +1477,11 @@ fn auth(
     // 发包走独立句柄（nic），与抓包句柄解耦，避免被长时间阻塞的收包路径饿死
     let packet_sender = spawn_packet_sender(cap.clone(), nic, local_mac, username, password); // 发送数据包
 
+    // dhcp_mode=3（认证前 DHCP）现在**已经真正实现**：见上面「认证前确保 DHCP 就绪」
+    // 那段 —— 它会在认证发起前先 IpReleaseAddress + IpRenewAddress 把租约翻新。
+    // 这里不再重复处理，只留一条日志。
     if dhcp_mode == 3 {
-        // 原实现是 panic!（release 下 panic='abort'，进程会直接消失），
-        // 改成只告警并按默认模式继续，避免一个配置项把客户端搞挂。
-        warn!("暂不支持『认证前 DHCP』模式(dhcp_mode=3)，按默认模式继续。");
+        info!("dhcp_mode=3：认证前 DHCP 已启用（释放+重续租约）");
     }
 
     // ================= 监督循环（状态机版） =================
@@ -1125,7 +1509,9 @@ fn auth(
     const FAIL_WAIT: Duration = Duration::from_secs(15);      // -r 失败等待
     const FAIL_WAIT_MAX: Duration = Duration::from_secs(120);
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
-    const OFFLINE_STRIKES: u32 = 6;   // 连续 6 次探测不通（约 30s）才判定掉线
+    const OFFLINE_STRIKES: u32 = 3;   // 连续 3 次探测不通（约 15s）即判定掉线
+    // 从 6 降到 3：实测掉线瞬间探测会在 15s 内全部失败，而「假失败」
+    // 只会连续出现 1~2 次（单个 ICMP 丢包），3 次足够区分，恢复快一半。
     const REOPEN_AFTER: u32 = 20;     // 持续不通约 1 分钟 → 重开网卡句柄
     // 认证成功后的「稳定期」：这段时间 DHCP 续约 / 接入控制尚未生效，
     // 网卡可能还挂着 169.254（APIPA）或 NAT 会话未建立 —— 此时探测必然假失败。
@@ -1150,6 +1536,15 @@ fn auth(
     let mut offline_strikes: u32 = 0;
     let mut last_reopen = Instant::now();
     let mut settle_until = Instant::now() + AUTH_SETTLE;   // 稳定期截止时刻
+    // 条件式补认证：只在「会话建立时网卡没有有效地址」的情况下做一次。
+    // 依据 2026-10-20 的对照：无租约时建立的会话 3607 s 准点掉数据，
+    // 而建立时已持有 10.x 的会话活了 207 分钟。
+    let mut rebind_due: Option<Instant> = None;
+    let mut rebind_done = false;
+    // 官方 CDhcpThread 的等价物：后台 DHCP 续租线程句柄（只启动一次）。
+    let mut dhcp_renewer: Option<std::thread::JoinHandle<()>> = None;
+    // 上次主动触发 DHCP 续租的时刻，避免每轮都去敲 iphlpapi。
+    let mut last_dhcp_kick = Instant::now();
 
     // 开局：发一次 EAPOL-Start（走独立发包句柄，不经抓包锁）
     let _ = packet_sender.send(Status::StartAuth { dest_mac });
@@ -1193,7 +1588,69 @@ fn auth(
                     session_start = Instant::now();
                     session_no += 1;
                     info!("[AUTH] 第 {} 次会话开始", session_no);
+                    info!(
+                        "[EVT:SESSION_BEGIN] sess={} t={} pid={}",
+                        session_no,
+                        now_stamp(),
+                        std::process::id()
+                    );
                     settle_until = Instant::now() + AUTH_SETTLE;
+
+                    // 官方由 CDhcpThread（独立 MFC 线程）持续 IpRenewAddress()。
+                    // 这里起一个等价的轻量线程：每 30 分钟续租一次 —— 校园网 DHCP
+                    // 租约通常 2 小时、T1(50% 租期)=1 小时，30 分钟稳稳早于 T1，
+                    // 且续租报文本身也能维持 BRAS 侧的数据通路。
+                    // （30 分钟是按 DHCP 语义推的，官方周期未在反编译里直接暴露。）
+                    if dhcp_renewer.is_none() {
+                        dhcp_renewer = dhcp::spawn_renewer(
+                            nic_name.clone(),
+                            mac_bytes,
+                            Duration::from_secs(1800),
+                        );
+                        info!("[DHCP] 已启动后台续租线程（周期 1800 秒）");
+                        info!(
+                            "[DHCP] 注：主动续租需要管理员权限；若无权限该线程会自行停用，"
+                        );
+                        info!("     系统 DHCP 客户端仍会在 T1 自动续租，不影响本功能。");
+                    }
+
+                    // 记下这次会话「出生」时的地址状态 —— 这是判断要不要补认证的唯一依据
+                    let birth_ip = campus_ipv4_of(&nic_name);
+                    if rebind_done {
+                        info!(
+                            "[SESSION] 补认证后的会话，起始地址 {}",
+                            birth_ip
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "none".to_string())
+                        );
+                        info!(
+                            "[EVT:SESSION_REBIND] sess={} ip={}",
+                            session_no,
+                            birth_ip
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "none".to_string())
+                        );
+                    } else if std::env::var("MENTORUST_FORCE_REBIND").is_ok() {
+                        // 测试钩子：强制走一次补认证，用来验证 [REBIND] 路径（不影响正常启动）
+                        rebind_due = Some(Instant::now() + Duration::from_secs(5));
+                        warn!("[REBIND] 测试钩子 MENTORUST_FORCE_REBIND 生效：5 秒后强制补一次重认证");
+                    } else if let Some(ip) = birth_ip {
+                        info!("[SESSION] 会话起始地址 {}（已持有租约，按正常策略保活）", ip);
+                        info!(
+                            "[EVT:SESSION_BIRTH] sess={} ip={} had_lease=1",
+                            session_no,
+                            ip
+                        );
+                    } else {
+                        rebind_due = Some(Instant::now() + AUTH_SETTLE);
+                        warn!(
+                            "[SESSION] 会话建立时网卡无 10.x 地址（APIPA/无租约）—— 这类会话易在 60 分钟准点被踢，等 DHCP 就绪后补一次重认证"
+                        );
+                        info!(
+                            "[EVT:SESSION_BIRTH] sess={} ip=none had_lease=0",
+                            session_no
+                        );
+                    }
                     // 认证刚成功就立刻补一个心跳：锐捷交换机/BRAS 依赖 0xBF 心跳
                     // 来激活并维持数据通路，越早发越好。
                     //
@@ -1227,7 +1684,16 @@ fn auth(
         } else {
             // 已授权：用「认证网卡自己」的地址探测（避免被同网段其它网卡"代答"）
             // 认证成功后的稳定期内直接视为在线，不做掉线判定（DHCP/NAT 未就绪）。
-            let online = campus_online(&nic_name) || Instant::now() < settle_until;
+            // 用带 MAC 兜底的判定：网卡 GUID 变化后仍能正确识别在线状态，
+            // 否则会陷入「每 30 秒误报一次掉线」的假阳性循环。
+            // 稳定期（认证后 AUTH_SETTLE=20s）内探测结果被强制当作「在线」，
+            // 此时消耗掉线模拟预算等于白烧 —— 所以稳定期内**不调用探测**，
+            // 预算只在真正计入 strike 的探测上消耗。
+            let online = if Instant::now() < settle_until {
+                true
+            } else {
+                campus_online_resilient(&nic_name, &local_mac)
+            };
 
             // 心跳与探测**解耦**：心跳是会话保活用的，必须无条件按周期发送。
             // 之前把心跳塞在 online 分支里 -> 一旦探测假失败就再也不发心跳，
@@ -1237,10 +1703,61 @@ fn auth(
                 last_heartbeat = Instant::now();
             }
 
+            // 条件式补认证：DHCP 拿到地址后，把「无租约时建立」的会话重绑一次。
+            // 走 ProbeStartAuth（Logoff×2 + StartAuth），与掉线重连同一条路径。
+            if let Some(due) = rebind_due {
+                if Instant::now() >= due {
+                    match campus_ipv4_of(&nic_name) {
+                        Some(ip) => {
+                            rebind_due = None;
+                            rebind_done = true;
+                            info!(
+                                "[REBIND] 已拿到 {}，补一次干净重认证，把会话绑回正常策略",
+                                ip
+                            );
+                            phase_auth = true;
+                            last_server = Instant::now();
+                            retry_at = Instant::now();
+                            offline_strikes = 0;
+                            let _ = packet_sender.send(Status::ProbeStartAuth { dest_mac });
+                            continue;
+                        }
+                        None => {
+                            // 官方 8021x.exe 不是干等 DHCP —— 它会主动
+                            // IpRenewAddress() 触发续租（CDhcpThread::RenewDhcpAddr，
+                            // FUN_1400A95C0）。这里每 10 秒敲一次，最多等 2 分钟。
+                            if Instant::now() >= due + Duration::from_secs(120) {
+                                warn!("[REBIND] 等不到 DHCP 地址，放弃补认证（会话按原样保活）");
+                                rebind_due = None;
+                            } else if last_dhcp_kick.elapsed() >= Duration::from_secs(10) {
+                                last_dhcp_kick = Instant::now();
+                                match dhcp::renew_dhcp(&nic_name, mac_ref) {
+                                    Ok(code) => info!(
+                                        "[REBIND] 已触发 DHCP 续租 (code={})，等待地址下发",
+                                        code
+                                    ),
+                                    Err(code) => {
+                                        warn!("[REBIND] DHCP 续租失败 (code=0x{:X})", code)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if online {
                 probe_ok += 1;
                 if offline_strikes > 0 {
                     info!("校园网已恢复在线。");
+                    warn!(
+                        "[EVT:RECOVERED] sess={} down_s={:.1} ip={}",
+                        session_no,
+                        session_start.elapsed().as_secs_f64(),
+                        campus_ipv4_of(&nic_name)
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "none".to_string())
+                    );
                     offline_strikes = 0;
                 }
             } else {
@@ -1270,6 +1787,18 @@ fn auth(
                         last_heartbeat.elapsed().as_secs_f64(),
                         ip
                     );
+                    // 机器可解析的掉线事件：会话号 + 精确在线时长 + 心跳间隔。
+                    // 3600s 准点掉线的判定完全依赖 up_s 这一项。
+                    // 一次性模式：掉线判定成立即关闭模拟。
+                    simulate_drop_disarm();
+                    warn!(
+                        "[EVT:DROP] sess={} up_s={:.1} since_hb_s={:.1} ip={} strikes={}",
+                        session_no,
+                        session_start.elapsed().as_secs_f64(),
+                        last_heartbeat.elapsed().as_secs_f64(),
+                        ip,
+                        offline_strikes
+                    );
                     phase_auth = true;
                     last_server = Instant::now();
                     retry_at = Instant::now();
@@ -1283,7 +1812,7 @@ fn auth(
         //   掉线前探测是否已经在抖？IP 是否变过？心跳是否还在按周期走？
         // 只有周期性样本才能回答，光有「出错时才写」的日志答不出来。
         if last_probe_report.elapsed() >= Duration::from_secs(60) {
-            let ip = campus_ipv4_of(&nic_name);
+            let ip = campus_ipv4_resilient(&nic_name, &local_mac);
             match (last_ip, ip) {
                 (Some(old), Some(new)) if old != new => {
                     warn!("[NET] 本机 10.x 地址变化: {} -> {}", old, new);
