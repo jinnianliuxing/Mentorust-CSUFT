@@ -2,7 +2,7 @@ use clap_derive::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "mentorust")]
-#[command(about = "针对EAP协议锐捷校园网认证 - 三伏天秋不洛", version = "0.3.1", author = "fuqiuluo")]
+#[command(about = "针对EAP协议锐捷校园网认证 - 三伏天秋不洛", version = "0.3.2", author = "fuqiuluo")]
 pub struct EapArgs {
     /// 不带子命令直接运行 = 一键认证（内置本机配置，认证成功后窗口自动关闭）
     #[command(subcommand)]
