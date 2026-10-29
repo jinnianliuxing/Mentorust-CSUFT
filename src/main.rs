@@ -1204,10 +1204,10 @@ fn release_lease(nic_name: &str, mac: &[u8; 6]) {
             info!("[LOGOFF] DHCP 租约已释放 (code={})，网卡不再持有校园网地址", code);
         }
         Err(code) => {
-            // 0x57 = ERROR_INVALID_PARAMETER（多半是缺管理员权限）
+            // 0x57 = ERROR_INVALID_PARAMETER（参数错误：适配器 Name 构造不正确，不是权限问题）
             // 0xC351 = 取网卡信息失败；0xC353 = 接口表里找不到该网卡
             warn!(
-                "[LOGOFF] 释放 DHCP 租约失败 (code=0x{:X})：网卡地址可能仍保留（用户态通常缺少权限）",
+                "[LOGOFF] 释放 DHCP 租约失败 (code=0x{:X})：网卡地址可能仍保留",
                 code
             );
         }

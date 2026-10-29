@@ -412,11 +412,12 @@ pub fn spawn_renewer(
             match renew_dhcp(&nic_name, mac_ref) {
                 Ok(code) => log::info!("[DHCP] 主动续租完成 (code={})", code),
                 Err(code) => {
-                    // IpRenewAddress 需要管理员权限；官方客户端能续是因为它的
-                    // SuService.exe 跑在 SYSTEM 服务里，而本项目是用户态程序，
-                    // 结构上做不到。没有权限就别刷屏了 —— 停掉这个线程。
+                    // 2026-10-29 实测更正：IpRenewAddress 普通用户权限就能成功调用。
+                    // 0x57 是 ERROR_INVALID_PARAMETER（Name 字段构造不正确），不是权限问题
+                    // （权限错误是 0x5）。当年把它当权限问题，正是 60 分钟墙看似无解的根源。
+                    // 修复后若仍失败，如实记录 code 并停掉线程，避免刷屏。
                     log::warn!(
-                        "[DHCP] 主动续租失败 (code=0x{:X})，多半是缺少管理员权限；停用后台续租",
+                        "[DHCP] 主动续租失败 (code=0x{:X})，停用后台续租（系统 DHCP 客户端仍在 T1 自动续租）",
                         code
                     );
                     break;
