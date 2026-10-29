@@ -41,10 +41,12 @@ pub const DHCP_ERR_NOTFOUND: u32 = 0xC353;
 
 #[cfg(windows)]
 mod imp {
-    use windows::Win32::Foundation::WIN32_ERROR;
+    use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, WIN32_ERROR};
     use windows::Win32::NetworkManagement::IpHelper::{
-        FreeMibTable, GetIfTable2, IpReleaseAddress, IpRenewAddress, IP_ADAPTER_INDEX_MAP,
-        MIB_IF_ROW2, MIB_IF_TABLE2,
+        FreeMibTable, GetAdaptersAddresses, GetIfTable2, IpReleaseAddress, IpRenewAddress,
+        GAA_FLAG_INCLUDE_ALL_INTERFACES, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+        GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, IP_ADAPTER_ADDRESSES_LH,
+        IP_ADAPTER_INDEX_MAP, MIB_IF_ROW2, MIB_IF_TABLE2,
     };
 
     /// 枚举本机所有网络接口，回调里挑出需要的行。
@@ -67,29 +69,156 @@ mod imp {
         Some(out)
     }
 
-    /// `IP_ADAPTER_INDEX_MAP.Name` 按 MSDN 规定**一律传 NULL**。
+    /// `IpRenewAddress` / `IpReleaseAddress` 要求的适配器名前缀。
     ///
-    /// 实测踩坑：把 pcap 的路径（`\Device\NPF_{GUID}`）塞进这个字段，
-    /// IpRenewAddress 会返回 0x7B（ERROR_INVALID_NAME）。这个字段只作占位，
-    /// 真正定位接口靠 `Index`。
-    fn null_name() -> [u16; 128] {
-        [0u16; 128]
+    /// 这两个 API 的 `IP_ADAPTER_INDEX_MAP.Name` 必须是 **TCPIP 设备路径**，
+    /// 即 `\DEVICE\TCPIP_{GUID}`。实测四种写法（2026-10-29，本机真实网卡）：
+    ///
+    /// ```text
+    /// Name 为空                  -> 0x57  ERROR_INVALID_PARAMETER
+    /// "{GUID}"                   -> 0x7B  ERROR_INVALID_NAME
+    /// "\DEVICE\TCPIP_{GUID}"     -> 0x00  成功
+    /// "\DEVICE\NPF_{GUID}"       -> 0x7B  ERROR_INVALID_NAME
+    /// ```
+    ///
+    /// 最后一行正是历史上那次误判的来源：把 **pcap 设备名**塞进来得到 0x7B，
+    /// 于是被推成「MSDN 规定一律传 NULL」，进而误认为「需要管理员权限」。
+    const TCPIP_PREFIX: &[u8] = br"\DEVICE\TCPIP_";
+
+    /// 把 `AdapterName` 组装成 `IP_ADAPTER_INDEX_MAP.Name`（`WCHAR[128]`）。
+    ///
+    /// `GetAdaptersAddresses` 给的 `AdapterName` 是**裸 `{GUID}`**，
+    /// 而 `GetInterfaceInfo` 给的是带前缀的完整路径。我们走前者是为了能按
+    /// MAC 精确匹配网卡，所以这里要自己补上 `\DEVICE\TCPIP_`。
+    fn build_adapter_name(src: &[u8]) -> [u16; 128] {
+        let mut out = [0u16; 128];
+        if src.is_empty() {
+            return out;
+        }
+        let mut i = 0usize;
+        // 裸 GUID 才需要补前缀；已经带路径的（理论上不会出现）原样保留。
+        if src.first() == Some(&b'{') {
+            for b in TCPIP_PREFIX {
+                out[i] = *b as u16;
+                i += 1;
+            }
+        }
+        for b in src.iter() {
+            if i >= 127 {
+                break;
+            }
+            out[i] = *b as u16;
+            i += 1;
+        }
+        out
     }
 
-    pub(super) unsafe fn renew(index: u32, _name: &str) -> u32 {
-        let map = IP_ADAPTER_INDEX_MAP {
-            Index: index,
-            Name: null_name(),
-        };
-        IpRenewAddress(&map)
+    /// 取该网卡的**完整** `IP_ADAPTER_INDEX_MAP`（`Index` + `Name` 都填好）。
+    ///
+    /// ## 为什么必须填 `Name`
+    ///
+    /// 曾经这里传的是 `Name: [0u16; 128]`（全零），并附了一条错误的推断
+    /// 「MSDN 规定一律传 NULL」。实测（2026-10-29，`probe_dhcp_struct.py`）：
+    ///
+    /// ```text
+    /// A  GetInterfaceInfo 完整结构      -> 0x00000000  OK
+    /// B  手拼 + Name 空（旧实现）        -> 0x00000057  ERROR_INVALID_PARAMETER
+    /// C  手拼 + Name 正确               -> 0x00000000  OK
+    /// D  Index 乱填 + Name 正确         -> 0x00000000  OK
+    /// ```
+    ///
+    /// 也就是说 **0x57 是参数错误、不是权限错误**，普通用户权限就能调通。
+    /// 旧注释里的 0x7B 是因为把 **pcap 设备路径** `\Device\NPF_{GUID}`
+    /// 塞进了这个字段 —— 那不是 IP 适配器名，正确的是 `\DEVICE\TCPIP_{GUID}`。
+    ///
+    /// 官方客户端（`analysis_report.md` §40.1）同样是传
+    /// `GetInterfaceInfo` 返回的完整结构，而不是自己拼。
+    ///
+    /// ## 为什么用 GetAdaptersAddresses 而不是 GetInterfaceInfo
+    ///
+    /// `GetInterfaceInfo` 只给 Index + Name，没法按 MAC 匹配；而同一张物理
+    /// 网卡会以多个 mini-port 出现在接口表里（WFP / Npcap / QoS 过滤驱动共用
+    /// 同一个 MAC），按名字或按序取都可能打到过滤驱动上。
+    /// `GetAdaptersAddresses` 同时给出 `PhysicalAddress`、`IfIndex` 和
+    /// `AdapterName`，可以一次按 MAC 精确定位。
+    ///
+    /// `index_hint` 是 pcap 侧算出来的 `InterfaceIndex`，仅在拿不到 MAC 时兜底。
+    pub(super) unsafe fn adapter_map_for(
+        mac: Option<&[u8; 6]>,
+        index_hint: u32,
+    ) -> Option<IP_ADAPTER_INDEX_MAP> {
+        const AF_UNSPEC: u32 = 0;
+        let flags = GAA_FLAG_SKIP_UNICAST
+            | GAA_FLAG_SKIP_ANYCAST
+            | GAA_FLAG_SKIP_MULTICAST
+            | GAA_FLAG_SKIP_DNS_SERVER
+            | GAA_FLAG_INCLUDE_ALL_INTERFACES;
+
+        // Two-call pattern: first call learns the size, second fills it.
+        let mut size: u32 = 0;
+        let rc = GetAdaptersAddresses(AF_UNSPEC, flags, None, None, &mut size);
+        if rc != ERROR_BUFFER_OVERFLOW.0 || size == 0 {
+            return None;
+        }
+        // Round up and add slack: the table can grow between the two calls.
+        let mut buf = vec![0u8; size as usize + 1024];
+        let mut size2 = buf.len() as u32;
+        let rc2 = GetAdaptersAddresses(
+            AF_UNSPEC,
+            flags,
+            None,
+            Some(buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH),
+            &mut size2,
+        );
+        if rc2 != 0 {
+            return None;
+        }
+
+        let mut cur = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+        let mut fallback: Option<IP_ADAPTER_INDEX_MAP> = None;
+        while !cur.is_null() {
+            let a = &*cur;
+            let if_index = a.Anonymous1.Anonymous.IfIndex;
+            let name_bytes = if a.AdapterName.is_null() {
+                &[][..]
+            } else {
+                core::ffi::CStr::from_ptr(a.AdapterName.0 as *const i8).to_bytes()
+            };
+
+            let mac_match = match mac {
+                Some(want) => {
+                    let len = a.PhysicalAddressLength as usize;
+                    len == 6 && len <= a.PhysicalAddress.len()
+                        && &a.PhysicalAddress[..len] == &want[..]
+                }
+                None => false,
+            };
+
+            if mac_match {
+                return Some(IP_ADAPTER_INDEX_MAP {
+                    Index: if_index,
+                    Name: build_adapter_name(name_bytes),
+                });
+            }
+            // Keep the index-match as a fallback but do NOT return early:
+            // a MAC match further down the list is more trustworthy.
+            if mac.is_none() && if_index == index_hint {
+                fallback = Some(IP_ADAPTER_INDEX_MAP {
+                    Index: if_index,
+                    Name: build_adapter_name(name_bytes),
+                });
+            }
+            cur = a.Next;
+        }
+        fallback
     }
 
-    pub(super) unsafe fn release(index: u32, _name: &str) -> u32 {
-        let map = IP_ADAPTER_INDEX_MAP {
-            Index: index,
-            Name: null_name(),
-        };
-        IpReleaseAddress(&map)
+    pub(super) unsafe fn renew(map: &IP_ADAPTER_INDEX_MAP) -> u32 {
+        IpRenewAddress(map)
+    }
+
+    pub(super) unsafe fn release(map: &IP_ADAPTER_INDEX_MAP) -> u32 {
+        IpReleaseAddress(map)
     }
 }
 
@@ -183,7 +312,11 @@ pub fn renew_dhcp(nic_name: &str, mac: Option<&[u8]>) -> Result<u32, u32> {
     #[cfg(windows)]
     {
         let index = if_index_of(nic_name, mac).ok_or(DHCP_ERR_NOTFOUND)?;
-        let code = unsafe { imp::renew(index, nic_name) };
+        // Pass the COMPLETE IP_ADAPTER_INDEX_MAP (Index + Name). An empty
+        // Name makes IpRenewAddress return 0x57 even for a valid Index.
+        let mac6 = mac.and_then(|m| <&[u8; 6]>::try_from(m).ok());
+        let map = unsafe { imp::adapter_map_for(mac6, index) }.ok_or(DHCP_ERR_NOTFOUND)?;
+        let code = unsafe { imp::renew(&map) };
         if code == 0 {
             Ok(DHCP_OK)
         } else {
@@ -204,7 +337,9 @@ pub fn release_dhcp(nic_name: &str, mac: Option<&[u8]>) -> Result<u32, u32> {
     #[cfg(windows)]
     {
         let index = if_index_of(nic_name, mac).ok_or(DHCP_ERR_NOTFOUND)?;
-        let code = unsafe { imp::release(index, nic_name) };
+        let mac6 = mac.and_then(|m| <&[u8; 6]>::try_from(m).ok());
+        let map = unsafe { imp::adapter_map_for(mac6, index) }.ok_or(DHCP_ERR_NOTFOUND)?;
+        let code = unsafe { imp::release(&map) };
         if code == 0 {
             Ok(DHCP_OK)
         } else {

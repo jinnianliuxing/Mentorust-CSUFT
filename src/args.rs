@@ -56,5 +56,17 @@ pub enum EapCommands {
         /// 网卡名称
         #[arg(short, long, default_value = "")]
         nic: String,
+    },
+    /// 诊断：只测 DHCP 续租，不发起认证、不会断网
+    ///
+    /// 用来确认 IpRenewAddress 是否真的能调通。认证前的 DHCP 分支只有在
+    /// 网卡**没有** 10.x 租约时才会走到，机器已经在线时测不出来。
+    DhcpTest {
+        /// 网卡名称（留空 = 自动挑校园网有线口）
+        #[arg(short, long, default_value = "")]
+        nic: String,
+        /// 加 `--release` 则先释放再续租（会短暂断网，慎用）
+        #[arg(long, default_value_t = false)]
+        release: bool,
     }
 }

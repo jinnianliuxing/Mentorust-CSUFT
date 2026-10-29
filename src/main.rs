@@ -544,6 +544,9 @@ fn main() {
         Some(EapCommands::PrintMac) => {
             net::print_all_network_mac();
         }
+        Some(EapCommands::DhcpTest { nic, release }) => {
+            dhcp_test(&nic, release);
+        }
         Some(EapCommands::Logoff { nic }) => {
             logoff(&nic);
         }
@@ -1116,6 +1119,75 @@ fn run_launcher() {
     let _ = std::io::stdin().read_line(&mut s);
 }
 
+/// 诊断：只测 DHCP 续租，不发 EAPOL、不改动当前连接。
+///
+/// `IpRenewAddress` 只续租已有租约，不会断网；`--release` 才会先释放
+/// （那会短暂失去地址，只在确实要验证释放路径时用）。
+fn dhcp_test(nic_name: &str, do_release: bool) {
+    let devices = match Device::list() {
+        Ok(d) => d,
+        Err(e) => {
+            error!("枚举网卡失败: {:?}", e);
+            return;
+        }
+    };
+
+    // 留空则自动挑一张带 10.x 的卡 —— 正常使用中就是校园网有线口。
+    let dev = if nic_name.is_empty() {
+        devices
+            .iter()
+            .find(|d| {
+                d.addresses.iter().any(|a| match a.addr {
+                    std::net::IpAddr::V4(v) => v.octets()[0] == 10,
+                    _ => false,
+                })
+            })
+            .or_else(|| devices.first())
+            .cloned()
+    } else {
+        devices.iter().find(|d| d.name == nic_name).cloned()
+    };
+
+    let Some(dev) = dev else {
+        error!("未找到网卡");
+        return;
+    };
+    let Some(inet) = net::get_network_interface_by_name(&dev.name) else {
+        error!("未找到网卡的MAC地址: {}", dev.name);
+        return;
+    };
+    let mac = inet.mac.unwrap().to_string().to_lowercase();
+    let mut local_mac = [0u8; 6];
+    if hex::decode_to_slice(mac.replace(":", ""), &mut local_mac).is_err() {
+        error!("MAC 解析失败: {}", mac);
+        return;
+    }
+
+    info!("[DHCP-TEST] 网卡: {}", dev.desc.clone().unwrap_or(dev.name.clone()));
+    info!("[DHCP-TEST] MAC : {}", mac);
+
+    // 当前地址，方便对照
+    let before = dhcp::wait_dhcp_ready(&dev.name, Duration::from_millis(1));
+    info!("[DHCP-TEST] 续租前地址: {:?}", before);
+
+    if do_release {
+        warn!("[DHCP-TEST] --release：先释放租约（会短暂失去地址）");
+        match dhcp::release_dhcp(&dev.name, Some(&local_mac)) {
+            Ok(c) => info!("[DHCP-TEST] IpReleaseAddress -> code={} (成功)", c),
+            Err(c) => error!("[DHCP-TEST] IpReleaseAddress -> code=0x{:X} (失败)", c),
+        }
+    }
+
+    match dhcp::renew_dhcp(&dev.name, Some(&local_mac)) {
+        Ok(c) => info!("[DHCP-TEST] IpRenewAddress -> code={} (成功)", c),
+        Err(c) => error!("[DHCP-TEST] IpRenewAddress -> code=0x{:X} (失败)", c),
+    }
+
+    // 给系统几秒钟走完 DHCP 握手再读地址
+    let after = dhcp::wait_dhcp_ready(&dev.name, Duration::from_secs(8));
+    info!("[DHCP-TEST] 续租后地址: {:?}", after);
+}
+
 /// 释放该网卡的 DHCP 租约（尽力而为，失败只记日志）。
 ///
 /// 官方客户端的做法是 `IpReleaseAddress()`（`dhcp::release_dhcp`）。
@@ -1426,9 +1498,11 @@ fn auth(
                 match dhcp::renew_dhcp(&nic_name, mac_ref) {
                     Ok(code) => info!("[DHCP] 续租已提交 (code={})", code),
                     Err(code) => {
-                        // 0x57/0x5 = 无管理员权限。本项目是用户态程序，结构上
-                        // 调不动 IpRenewAddress —— 官方能调是因为它的 SuService.exe
-                        // 是 SYSTEM 服务。此时只能靠「等」，交给系统 DHCP 客户端。
+                        // 0x57 = ERROR_INVALID_PARAMETER，不是权限问题
+                        // （权限问题是 0x5）。2026-10-29 实测：把完整的
+                        // IP_ADAPTER_INDEX_MAP（Index + Name）传进去，普通
+                        // 用户权限就能调通；传空 Name 才会拿到 0x57。
+                        // 所以真出现 0x57 要先查 map 构造，而不是断定"没权限"。
                         warn!(
                             "[DHCP] 续租请求被拒 (code=0x{:X})，降级为纯等待系统 DHCP 客户端",
                             code
