@@ -1330,6 +1330,14 @@ pub fn run() {
             // exe 可能被挪过位置 → 顺手把 Run 项刷新成当前路径（否则开机拉起的是旧位置）
             set_autostart(true);
         }
+        // 开机自启（--startup）代表**新的开机周期**：上一次「手动断开」只约束当次会话。
+        // 不清掉的话，用户断开一次、此后每次重启都不自动联网（2026-11-03 实测到：
+        // 重启后 [LATCH] 生效，一直等到手动点「连接」）。手动双击 exe 不带 --startup，
+        // 不会走到这里，闩锁照常生效 —— 「断开后不重启、直接双击」仍然是断开状态。
+        if STARTUP_LAUNCH.load(Ordering::SeqCst) && crate::manual_disconnect_latched() {
+            crate::set_stop_flag(false);
+            log::info!("[LATCH] 开机自启（--startup）清除上次会话的手动断开闩锁，恢复自动连接");
+        }
         // 「手动断开」闩锁优先：用户主动断开后，任何自动路径都不许再连回来。
         // （这一处以前漏了检查 → logoff 之后 GUI 会自己把 ghost 拉起来，
         //   表现为"刚断开又自动连上"。）
