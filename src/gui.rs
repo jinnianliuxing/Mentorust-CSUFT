@@ -9,6 +9,7 @@
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -120,6 +121,17 @@ static ICON_OFF: AtomicIsize = AtomicIsize::new(0);
 static EXITING: AtomicBool = AtomicBool::new(false);
 /// 「已最小化到托盘」的提示只弹一次，不然每次关窗都打扰
 static TRAY_HINTED: AtomicBool = AtomicBool::new(false);
+/// Explorer（任务栏）重启后会重建托盘区、清空所有程序图标，并广播 "TaskbarCreated"。
+/// 该消息 ID 由系统动态分配，进程内注册一次后缓存复用。
+static TASKBAR_CREATED_MSG: OnceLock<u32> = OnceLock::new();
+
+/// 返回 "TaskbarCreated" 的动态消息 ID（注册失败返回 0，不会与任何真实消息冲突）
+fn taskbar_created_msg() -> u32 {
+    *TASKBAR_CREATED_MSG.get_or_init(|| unsafe {
+        let wide = wide("TaskbarCreated");
+        RegisterWindowMessageW(PCWSTR(wide.as_ptr())) as u32
+    })
+}
 
 /// `main` 识别到 `--startup` 时调用：标记本次为开机自启动拉起。
 pub fn set_startup_launch(on: bool) {
@@ -1029,6 +1041,16 @@ unsafe fn tray_exit(hwnd: HWND) {
 // ===== 窗口过程 =====
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Explorer / 任务栏重启会重建托盘区、清空所有程序图标，并广播 "TaskbarCreated"。
+    // 动态消息 ID 无法写成 match 常量分支，必须在 match 之前拦截。
+    // 收到后强制清掉 TRAY_ADDED 再重挂，否则程序以为图标还在、实际早已消失。
+    let tbm = taskbar_created_msg();
+    if tbm != 0 && msg == tbm {
+        log::info!("[TRAY] 检测到任务栏重建（TaskbarCreated），重新挂载托盘图标");
+        TRAY_ADDED.store(false, Ordering::SeqCst);
+        tray_add(hwnd);
+        return LRESULT(0);
+    }
     match msg {
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as i32;
